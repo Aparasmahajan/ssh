@@ -1,0 +1,21 @@
+[package]
+name = "opspilot-tauri"
+description = "OpsPilot desktop shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri.workspace = true
+opspilot-app = { path = "../crates/app" }
+
+# Desktop-only, so a plain binary. The Tauri v2 template ships lib + bin for
+# mobile targets; OpsPilot has none, and the extra crate-type would only be
+# surface area to keep compiling.
+[[bin]]
+name = "opspilot"
+path = "src/main.rs"

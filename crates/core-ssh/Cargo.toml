@@ -1,0 +1,42 @@
+[package]
+name = "opspilot-core-ssh"
+description = "SSH transport, channel multiplexing, connection pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# CLAUDE.md §16 requires a note on every dependency.
+#
+#   russh      — named by §3 as the SSH implementation. Pure Rust, async, and the
+#                only mature option that does not shell out to libssh2/OpenSSL.
+#   tokio      — §3: "tokio (many-connection I/O)". The terminal hot path stays
+#                deliberately off it (§13.2); this runtime is for the network.
+#   russh-sftp — the SFTP subsystem. Its *server* half is what lets the
+#                integration tests run a real SSH server in-process, with no
+#                external sshd and no Docker.
+#
+# All of it is lazy: nothing is touched until a connection is opened, so the
+# 250ms cold-start budget (§14.5) is unaffected.
+[dependencies]
+# `ring` rather than the default `aws-lc-rs` backend. aws-lc-sys compiles AWS-LC
+# from C source and needs NASM and CMake on the build machine; it fails outright
+# without them ("NASM command not found"). `ring` ships pregenerated assembly, so
+# a checkout builds with nothing but a Rust toolchain and a linker.
+#
+# This is a build-environment choice, not a security one: both are audited
+# implementations and both use hardware AES where available, which is what §6.4
+# actually cares about ("Runtime-detect AES-NI... Wrong cipher choice alone is a
+# 3x throughput difference").
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+# Test-only. The vault is not part of the transport, but the claim "a stored
+# secret can actually authenticate" spans both crates, so the test that proves
+# it has to as well. A dev-dependency keeps the shipped crate graph unchanged.
+opspilot-core-store = { path = "../core-store" }

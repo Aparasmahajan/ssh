@@ -1,0 +1,34 @@
+[package]
+name = "opspilot-app"
+description = "Tauri commands and wiring for OpsPilot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tauri.workspace = true
+serde.workspace = true
+
+# The terminal engine. No longer optional: a session IS a terminal, so there is
+# no configuration in which the app is useful without it.
+opspilot-core-term = { path = "../core-term" }
+
+# SSH and SFTP. Feature-gating this per §3 was considered and rejected: a tool
+# whose name is "unified engineering workspace" has no configuration in which
+# remote access is optional, and gating it would mean two build shapes to test.
+opspilot-core-ssh = { path = "../core-ssh" }
+opspilot-core-store = { path = "../core-store" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# PTY. CLAUDE.md §16 requires a note on any new dependency:
+#   portable-pty (from wezterm) wraps ConPTY on Windows and openpty elsewhere.
+#   ~90 KB of the release binary and no startup cost — nothing initialises until
+#   a session is opened. The alternative is writing ConPTY FFI by hand, and
+#   §5.9 is already explicit that ConPTY is a source of subtle trouble that is
+#   "not your bug to fix in Rust".
+portable-pty = "0.8"
+
+# Still NOT wired in — §3 wants engine crates behind feature flags, lazy-loaded:
+# opspilot-core-sftp  = { path = "../core-sftp",  optional = true }
+# opspilot-render     = { path = "../render",     optional = true }

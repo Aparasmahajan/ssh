@@ -1,0 +1,28 @@
+/* Tailwind layers only. Every value resolves to a token in tokens.css.
+   Loaded BETWEEN fonts.css and tokens.css (see src/main.tsx) so that the base
+   overrides at the bottom of tokens.css win over Preflight. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  /* §0.6: "Never a row hover that changes background lightness by more than 4%
+     — it flickers when you drag across a long list."
+
+     chassis-800 → chassis-700 is about 4.4% in L*, just over the line, so the
+     hover is a partial mix of rail-600 instead: roughly +2% L*. Expressed with
+     color-mix so the value still derives entirely from tokens (the no-hex rule
+     is about provenance, not just syntax). Selection DOES use chassis-700 —
+     tokens.css names it "selected row" — because a click is deliberate and a
+     4.4% step is the right amount of feedback for it. */
+  .row-hoverable {
+    background-color: transparent;
+    transition: background-color var(--dur-hover) var(--ease);
+  }
+  .row-hoverable:hover {
+    background-color: color-mix(in srgb, var(--rail-600) 35%, transparent);
+  }
+  .row-hoverable[aria-selected="true"] {
+    background-color: var(--chassis-700);
+  }
+}

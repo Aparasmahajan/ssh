@@ -1,0 +1,26 @@
+[package]
+name = "opspilot-core-term"
+description = "Terminal engine: SoA grid, VT500 DFA parser, ring scrollback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# CLAUDE.md §16: "No new dependency without a note on binary size and cold-start
+# impact." Runtime dependencies: none, still.
+#
+# §5.2 suggests memchr for the ASCII bulk path. It is not used, because memchr
+# searches for specific bytes and the predicate here is a RANGE — "next byte
+# < 0x20 or >= 0x7F". That is implemented as SWAR over u64 words in
+# parser::ascii_run_len, which needs no crate and no unsafe. Keeping this crate
+# dependency-free also keeps it out of the cold-start budget entirely.
+[dependencies]
+
+[dev-dependencies]
+# Benchmarks and property tests only; never linked into the shipped binary.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
+
+[[bench]]
+name = "term"
+harness = false

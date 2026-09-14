@@ -1,0 +1,151 @@
+/* ==========================================================================
+   OpsPilot — design tokens
+   The single source of truth for colour, type, spacing, and motion.
+   Mirrors the Figma variable collection "OpsPilot Color":
+   https://www.figma.com/design/wkE7H0umKnwHYtijV6oXXo
+
+   RULE: no hex literal may appear in any .tsx/.ts file. Enforced by ESLint.
+   If a value is missing here, add it here — do not inline it.
+   ========================================================================== */
+
+:root {
+  /* ---- Chassis: cool graphite. Never pure black; #000 flares in dark rooms -- */
+  --chassis-900: #14171C;   /* app background */
+  --chassis-800: #1B1F26;   /* panel background */
+  --chassis-700: #252A33;   /* raised surface, active tab, selected row */
+  --rail-600:    #313846;   /* inset wells, meter tracks */
+  --bezel-500:   #3A4252;   /* hairlines, port-chip borders, dividers */
+
+  /* ---- Text: cool bone. Never #FFFFFF; white on graphite vibrates ---------- */
+  --text-hi:  #E8ECF2;
+  --text-mid: #9AA6B8;
+  --text-lo:  #667487;
+
+  /* ---- Signal: the LED palette --------------------------------------------
+     amber = PRIMARY ACCENT (activity, selection, focus)
+     cyan  = LINK STATE ONLY. Never an action colour, or "connected"
+             stops being readable at a glance.
+     violet = AI-originated content ONLY. Reserved. Not for symlinks,
+              not for decoration. A user must never mistake generated
+              output for real system output. */
+  --amber-500:  #F2A93B;
+  --amber-900:  #4A3411;   /* amber at ~12%, for chip fills */
+  --cyan-400:   #4FD1C5;
+  --red-500:    #E5484D;
+  --violet-400: #A78BFA;
+
+  /* ---- Environment cable-tie colours --------------------------------------
+     Appears in exactly ONE place per row: a 3px left edge bar.
+     Never as a row background tint — that destroys terminal contrast. */
+  --env-prod:     #E5484D;
+  --env-stage:    #F2A93B;
+  --env-dev:      #4FD1C5;
+  --env-test:     #A78BFA;
+  --env-customer: #6B8AFD;
+
+  /* ---- Type ---------------------------------------------------------------
+     IBM Plex superfamily: designed for hardware operator interfaces,
+     which is exactly the register this product is in.
+     JetBrains Mono is for the terminal buffer ONLY, ligatures off. */
+  --font-sans:      "IBM Plex Sans", system-ui, sans-serif;
+  --font-condensed: "IBM Plex Sans Condensed", "IBM Plex Sans", sans-serif;
+  --font-mono:      "IBM Plex Mono", ui-monospace, monospace;
+  --font-term:      "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+
+  /* Line heights are ALWAYS explicit. `normal` shifts vertical rhythm
+     a few px per row and density looks subtly wrong. */
+  --text-micro:      11px;  --leading-micro:   16px;  /* port chips, status rail */
+  --text-small:      12px;  --leading-small:   18px;  /* WORKHORSE: rows, cells, tabs */
+  --text-base:       13px;  --leading-base:    20px;  /* dialogs, inspector */
+  --text-large:      15px;  --leading-large:   22px;  /* module titles */
+  --text-display:    20px;  --leading-display: 26px;  /* command palette input */
+  --text-eyebrow:     9px;  --leading-eyebrow: 12px;  /* small-caps section labels */
+
+  --tracking-eyebrow: 0.10em;   /* condensed small-caps needs the air */
+  --tracking-chip:    0.02em;
+  --tracking-code:    0.04em;
+
+  /* ---- Layout ------------------------------------------------------------- */
+  --rail-w:        48px;
+  --tree-w:       260px;   /* resizable 200–480 */
+  --inspector-w:  280px;
+  --status-h:      28px;
+  --tabstrip-h:    38px;
+  --row-h-compact: 26px;
+  --radius:         3px;   /* the only radius in the system */
+  --radius-sm:      2px;   /* meter fills, progress tracks */
+
+  /* ---- Motion ------------------------------------------------------------
+     Nothing longer than 180ms. An ops tool that animates makes you wait. */
+  --ease:            cubic-bezier(0.2, 0, 0.3, 1);
+  --dur-hover:       120ms;
+  --dur-panel:       180ms;
+  --hairline:          1px;  /* overridden at fractional DPI below */
+}
+
+/* ==========================================================================
+   Hairlines at fractional DPI
+   At 125%/150% Windows scaling, a 1px border lands on a half-pixel and
+   either blurs or drops out entirely. The 3px environment bar is the most
+   visible casualty. Verify at 100%, 125%, and 150%.
+   ========================================================================== */
+@media (min-resolution: 1.25dppx) {
+  :root { --hairline: 0.5px; }
+}
+
+/* ==========================================================================
+   Reduced motion — a hard requirement, not a nicety.
+   The link strip stops animating and renders a static bar coloured by
+   current RTT (see UI_BUILD_GUIDE §0.4).
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-hover: 0.01ms; --dur-panel: 0.01ms; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--chassis-900);
+  color: var(--text-hi);
+  font-family: var(--font-sans);
+  font-size: var(--text-small);
+  line-height: var(--leading-small);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;          /* the shell owns all scrolling */
+}
+
+/* Every numeric — IP, port, latency, byte count — is mono + tabular.
+   A throughput readout whose digits change width reads as broken. */
+.num, .num * {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* Terminal buffer. Ligatures OFF: `!=` must not render as `≠` in a shell. */
+.term {
+  font-family: var(--font-term);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+/* Focus is always visible. Never `outline: none` without a replacement. */
+:focus-visible {
+  outline: 2px solid var(--amber-500);
+  outline-offset: 2px;
+}
+
+/* Desktop chrome should not feel like a web page */
+::selection { background: var(--amber-900); color: var(--amber-500); }
+* { -webkit-user-drag: none; }
+.selectable { user-select: text; }

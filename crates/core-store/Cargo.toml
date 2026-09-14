@@ -1,0 +1,40 @@
+[package]
+name = "opspilot-core-store"
+description = "TOML config as source of truth, index cache, vault."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# CLAUDE.md §16 note:
+#   toml  — §12.2 mandates TOML specifically, over YAML: "YAML will silently
+#           coerce a port value of `no` into `false`. That class of bug does not
+#           belong in a tool that connects to production."
+#   serde — already in the workspace.
+#   dirs  — resolving the portable config root per platform. Small, and
+#           hand-rolling the Windows/macOS/XDG rules is exactly the sort of thing
+#           that stays wrong on one platform for a year.
+#   notify — §12.2's hot reload, which it names by crate. Wraps
+#            ReadDirectoryChangesW / inotify / FSEvents; hand-rolling three
+#            platform APIs to save a dependency is a poor trade. Started lazily
+#            on first poll, so it costs nothing against the §4 cold-start budget.
+[dependencies]
+serde.workspace = true
+toml = "0.9"
+dirs = "6"
+notify = "8"
+
+# Vault (§12.3). All RustCrypto, all pure Rust — no NASM, no CMake, which is
+# what made the default russh backend unbuildable here (§18.7).
+#
+#   aes-gcm  — §12.3 names AES-256-GCM explicitly. Uses AES-NI at runtime.
+#   argon2   — §12.3 names Argon2id with m=64 MiB, t=3, p=4.
+#   zeroize  — §12.3: "Keys live in zeroize'd, mlock'ed buffers. Never a String."
+#   blake3   — the hash-chained audit log, h[n] = blake3(h[n-1] || entry).
+#   rand     — nonces and salts. OsRng only; a vault nonce from a PRNG is a
+#              catastrophic reuse risk.
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+blake3 = "1"
+rand = "0.8"

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+*.local
+
+# Vendored from @fontsource by scripts/vendor-fonts.mjs on postinstall.
+src/styles/fonts/*.woff2
+
+# Playwright
+test-results/
+playwright-report/
+tests/visual/*-actual.png
+tests/visual/*-diff.png

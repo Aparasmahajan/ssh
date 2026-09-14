@@ -1,0 +1,50 @@
+# OpsPilot Rust workspace.
+#
+# Crate layout is UI_BUILD_GUIDE Step 1 verbatim:
+#   crates/core-term   grid, VT parser, scrollback
+#   crates/core-ssh    transport, channels, connection pool
+#   crates/core-sftp   pipelined transfer engine
+#   crates/core-store  config files, index cache, vault
+#   crates/render      wgpu glyph atlas renderer
+#   crates/app         Tauri commands, wiring
+#   src-tauri          the Tauri binary (owns tauri.conf.json)
+#
+# NOT COMPILED YET. There is no Rust toolchain on the machine this was authored
+# on, so nothing here has been through cargo. See COMPLETED.md.
+
+[workspace]
+members = ["crates/*", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Proprietary"
+
+[workspace.dependencies]
+tauri = { version = "2" }
+tauri-build = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLAUDE.md §3 states this profile as a hard rule, not a tuning knob:
+#   "Release profile is fixed: lto = "fat", codegen-units = 1,
+#    panic = "abort", opt-level = 3. PGO + BOLT in CI (§14.4)."
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
+
+# A terminal emulator built at opt-level 0 is too slow to develop against — the
+# VT parser and cell blitter are hot even in a debug session. opt-level 1 keeps
+# builds fast while leaving the app usable.
+[profile.dev]
+opt-level = 1
+
+# Dependencies stay optimized even in dev builds: nobody debugs into russh's
+# cipher code, and an unoptimized crypto path makes SFTP unusable locally.
+[profile.dev.package."*"]
+opt-level = 3

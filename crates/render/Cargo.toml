@@ -1,0 +1,13 @@
+[package]
+name = "opspilot-render"
+description = "wgpu glyph atlas renderer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies yet, deliberately. CLAUDE.md §16: "No new dependency without a
+# note on binary size and cold-start impact" — and §3 requires the engine crates
+# to sit behind feature flags and lazy-load, so russh/wgpu/arrow arrive with the
+# code that uses them, not before it.
+[dependencies]
