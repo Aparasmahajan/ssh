@@ -3,15 +3,18 @@
  *
  * `npm run desktop:dev` fails with a fairly opaque error when the Rust toolchain
  * is missing, and on Windows it fails a second, different way when the MSVC
- * linker is missing. This says which, up front, with the command that fixes it.
+ * linker is missing. On Linux it fails a third way: `webkit2gtk-sys` panics in
+ * its build script when pkg-config cannot find the WebKitGTK development
+ * headers. This says which, up front, with the command that fixes it.
  *
  * Run:  npm run doctor
  */
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:process";
 
 const win = platform === "win32";
+const linux = platform === "linux";
 let blocking = 0;
 
 function have(cmd) {
@@ -68,6 +71,61 @@ if (win) {
   });
 }
 
+if (linux) {
+  // Tauri v2 on Linux links WebKitGTK 4.1 (the libsoup3 build) — not 4.0, which
+  // is what most older tutorials install. Probed through pkg-config because
+  // that is exactly how the -sys crates find them; if pkg-config cannot, the
+  // build cannot either.
+  const pm = linuxPackages();
+
+  check({
+    name: "C compiler and linker (cc)",
+    ok: have("cc"),
+    fix: pm.install(pm.toolchain),
+  });
+
+  const pkgConfig = have("pkg-config");
+  check({
+    name: "pkg-config",
+    ok: pkgConfig,
+    fix: pm.install(pm.pkgconfig),
+  });
+
+  const libs = [
+    ["webkit2gtk-4.1", "WebKitGTK 4.1 (the webview)"],
+    ["javascriptcoregtk-4.1", "JavaScriptCoreGTK 4.1"],
+    ["libsoup-3.0", "libsoup 3"],
+    ["gtk+-3.0", "GTK 3"],
+  ];
+  const missing = pkgConfig ? libs.filter(([pc]) => !pkgExists(pc)) : libs;
+  check({
+    name: "WebKitGTK / GTK development libraries",
+    ok: missing.length === 0,
+    fix:
+      (pkgConfig ? `missing: ${missing.map(([, n]) => n).join(", ")}\n      ` : "") +
+      pm.install(pm.webkit),
+  });
+
+  // Not needed to compile; needed by the bundler for the AppImage/.deb icons.
+  check({
+    name: "librsvg (bundling only)",
+    ok: pkgConfig && pkgExists("librsvg-2.0"),
+    fix: pm.install(pm.rsvg),
+    blocks: false,
+  });
+
+  // Agent auth on Linux is SSH_AUTH_SOCK, set by the desktop session (GNOME
+  // Keyring, KDE's ksshaskpass setup, or `eval $(ssh-agent)`). A launcher icon
+  // started outside such a session will not see it, and agent auth then fails
+  // with "no SSH agent" even though `ssh` works in a terminal.
+  check({
+    name: "SSH agent reachable (SSH_AUTH_SOCK)",
+    ok: !!process.env.SSH_AUTH_SOCK && existsSync(process.env.SSH_AUTH_SOCK),
+    fix: "start an agent (`eval $(ssh-agent)`) or enable your desktop's keyring agent — key-file and vault auth work without one",
+    blocks: false,
+  });
+}
+
 check({
   name: "@tauri-apps/cli",
   ok: existsSync("node_modules/@tauri-apps/cli"),
@@ -83,6 +141,72 @@ check({
   fix: "node scripts/make-icon.mjs && npx tauri icon src-tauri/icons/source.png",
   blocks: win,
 });
+
+function pkgExists(name) {
+  try {
+    execFileSync("pkg-config", ["--exists", name], { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Package names differ per distro family; detect from /etc/os-release. */
+function linuxPackages() {
+  let ids = "";
+  try {
+    const rel = readFileSync("/etc/os-release", "utf8");
+    const field = (k) => rel.match(new RegExp(`^${k}=\"?([^\"\\n]*)`, "m"))?.[1] ?? "";
+    ids = `${field("ID")} ${field("ID_LIKE")}`;
+  } catch {
+    /* no os-release: fall through to the generic hint */
+  }
+  const is = (...names) => names.some((n) => ids.split(/\s+/).includes(n));
+
+  if (is("debian", "ubuntu")) {
+    return {
+      install: (p) => `sudo apt install ${p}`,
+      toolchain: "build-essential",
+      pkgconfig: "pkg-config",
+      webkit: "libwebkit2gtk-4.1-dev",
+      rsvg: "librsvg2-dev",
+    };
+  }
+  if (is("fedora", "rhel", "centos")) {
+    return {
+      install: (p) => `sudo dnf install ${p}`,
+      toolchain: "gcc",
+      pkgconfig: "pkgconf-pkg-config",
+      webkit: "webkit2gtk4.1-devel",
+      rsvg: "librsvg2-devel",
+    };
+  }
+  if (is("arch", "manjaro", "endeavouros")) {
+    return {
+      install: (p) => `sudo pacman -S --needed ${p}`,
+      toolchain: "base-devel",
+      pkgconfig: "pkgconf",
+      webkit: "webkit2gtk-4.1",
+      rsvg: "librsvg",
+    };
+  }
+  if (is("opensuse", "suse", "opensuse-tumbleweed", "opensuse-leap")) {
+    return {
+      install: (p) => `sudo zypper in ${p}`,
+      toolchain: "-t pattern devel_basis",
+      pkgconfig: "pkg-config",
+      webkit: "webkit2gtk3-devel libsoup3-devel",
+      rsvg: "librsvg-devel",
+    };
+  }
+  return {
+    install: (p) => `install the ${p} development package(s) for your distribution`,
+    toolchain: "C compiler",
+    pkgconfig: "pkg-config",
+    webkit: "WebKitGTK 4.1",
+    rsvg: "librsvg",
+  };
+}
 
 console.log(
   blocking === 0

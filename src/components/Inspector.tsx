@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { humanSize, type ConnectionInfo } from "@/lib/remote";
+import { MOD_LABEL } from "@/lib/platform";
 import { useSettings } from "@/state/settings";
 
 /**
@@ -130,7 +131,7 @@ export function Inspector({ connection }: { connection: ConnectionInfo | null })
         </Group>
 
         <Group title="display">
-          <Row label="font" value={`${fontPx}px`} hint="Ctrl + / − / 0" />
+          <Row label="font" value={`${fontPx}px`} hint={`${MOD_LABEL} + / − / 0`} />
         </Group>
       </div>
     </aside>

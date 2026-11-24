@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { MOD_LABEL, keyHint } from "@/lib/platform";
+import { CHORD, MOD_LABEL, SHIFT_LABEL, chordHint, keyHint } from "@/lib/platform";
 import { IS_DESKTOP, desktopVersion } from "@/lib/runtime";
 import { humanSize } from "@/lib/remote";
 import { usePanes, type Node } from "@/state/panes";
@@ -160,7 +160,7 @@ export function StatusRail({ onOpenVault }: { onOpenVault?: () => void }) {
         <span
           className="num rounded border-hairline border-amber-500 bg-amber-900 px-[6px]
                      uppercase text-micro text-amber-500"
-          title="Every keystroke goes to every pane in this tab. Ctrl+Shift+B to stop."
+          title={`Every keystroke goes to every pane in this tab. ${keyHint(MOD_LABEL, SHIFT_LABEL, "B")} to stop.`}
         >
           broadcast · {paneCount} panes
         </span>
@@ -234,7 +234,7 @@ export function StatusRail({ onOpenVault }: { onOpenVault?: () => void }) {
           </span>
         )}
         <kbd className="num border-hairline border-bezel-500 px-1 py-[1px] text-micro text-text-lo">
-          {keyHint(MOD_LABEL, "K")}
+          {chordHint(CHORD.palette)}
         </kbd>
       </span>
     </footer>

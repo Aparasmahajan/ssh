@@ -423,3 +423,55 @@ The threat §12.3 names by name — webview XSS — is covered; the broader one 
 Replacing it later touches `crates/app/src/vault.rs` and nothing above it: the
 frontend already speaks in references rather than values, which is the part that
 would otherwise have to change.
+
+---
+
+### D-24 — app chords are Ctrl+Shift on Linux and Windows
+
+UI_BUILD_GUIDE writes every binding as ⌘X, and `platform.ts` translated ⌘ to Ctrl
+off macOS. For a window that is mostly a terminal, that translation is wrong:
+**Ctrl+letter is a byte the shell owns.** Measured against the old bindings:
+
+| Chord | The shell's meaning | What the app did with it |
+|---|---|---|
+| Ctrl+W | delete previous word | **closed the session** |
+| Ctrl+K | kill to end of line | opened the palette |
+| Ctrl+B | tmux prefix, back one char | toggled the tree |
+| Ctrl+I | *is* Tab (0x09) | toggled the inspector |
+| Ctrl+_ | readline undo | font zoom out |
+
+So off macOS every app chord adds Shift — palette Ctrl+Shift+K, inspector
+Ctrl+Shift+I, zoom Ctrl+Shift+Enter, close tab Ctrl+Shift+W, copy/paste
+Ctrl+Shift+C/V. That is the convention GNOME Terminal, Konsole, kitty and Windows
+Terminal share. The tree is Ctrl+Shift+**E** (VS Code's explorer chord), because
+Ctrl+Shift+B was already broadcast. macOS keeps ⌘, which no terminal program sees.
+
+Kept on plain Ctrl, because no control code lives there: Ctrl+1–9 (tabs),
+Ctrl+PageUp/PageDown (cycle tabs, as in GNOME Terminal), Ctrl+= / Ctrl+- / Ctrl+0
+(font size).
+
+The bindings live in one table, `CHORD` in `src/lib/platform.ts`, and the hint
+labels are generated from it by `chordHint`, so a label cannot advertise a chord the
+handler does not listen for.
+
+---
+
+### D-25 — paste is read natively and never returned to the webview
+
+A `clipboard_read` command would hand the webview whatever the user last copied,
+which is routinely a password. That is the class of command D-23 forbids. So paste
+is `session_paste(ids, selection)`: Rust reads the clipboard and writes it to the
+PTYs itself. The webview can *cause* a paste but never sees its contents.
+`no_command_returns_a_secret` now also bans `clipboard_read`/`clipboard_get`.
+
+On Linux the clipboard is the window's own GTK clipboard, marshalled to the main
+thread. It is correct on X11 and native Wayland, and it is the only route to PRIMARY
+(select to copy, middle-click to paste). `gtk` was already linked by Tauri, so this
+adds no crate. On Windows and macOS the native side answers `unsupported` and the
+frontend falls back to `navigator.clipboard`, which does expose the text to the
+webview there. That residual gap is documented rather than hidden. Closing it means a
+native clipboard on those platforms too, and nothing above `clipboard.rs` changes.
+
+Bracketed paste is decided in Rust, because only the Rust side knows the
+application's current `?2004` state. Any `ESC[201~` inside the pasted text is
+stripped, so clipboard content cannot close the bracket early and type the rest.

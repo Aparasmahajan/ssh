@@ -60,7 +60,18 @@ pub fn list(path: &str) -> Result<LocalListing, String> {
     for e in rd.flatten() {
         // A permission error on one entry must not fail the whole listing —
         // Windows user profiles are full of junctions that cannot be stat'd.
-        let Ok(meta) = e.metadata() else { continue };
+        let Ok(link_meta) = e.metadata() else { continue };
+        // `DirEntry::metadata` does not follow symlinks. On Linux they are
+        // everywhere — `/bin` and `/lib` are symlinks on every usr-merged
+        // distro, and dotfile managers make ~/.config a forest of them — and
+        // the pane only navigates into "dir". So follow the link and report
+        // what it points at, the way `ls -L` and every file manager do. Only a
+        // dangling link stays "symlink", which is the one case worth flagging.
+        let meta = if link_meta.file_type().is_symlink() {
+            std::fs::metadata(e.path()).unwrap_or(link_meta)
+        } else {
+            link_meta
+        };
         let kind = if meta.is_dir() {
             "dir"
         } else if meta.file_type().is_symlink() {

@@ -19,7 +19,9 @@ opspilot-core-term = { path = "../core-term" }
 # remote access is optional, and gating it would mean two build shapes to test.
 opspilot-core-ssh = { path = "../core-ssh" }
 opspilot-core-store = { path = "../core-store" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `sync` for the oneshot that carries a clipboard read back from the GTK main
+# thread. A feature of a crate already linked, not a new dependency.
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 # PTY. CLAUDE.md §16 requires a note on any new dependency:
 #   portable-pty (from wezterm) wraps ConPTY on Windows and openpty elsewhere.
@@ -28,6 +30,15 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 #   §5.9 is already explicit that ConPTY is a source of subtle trouble that is
 #   "not your bug to fix in Rust".
 portable-pty = "0.8"
+
+# Linux clipboard, including PRIMARY (crate::clipboard). §16 note: zero cost —
+# Tauri already links gtk 0.18 on Linux for the window itself, so this only
+# makes the dependency nameable. Version must track Tauri's (see Cargo.lock).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[dev-dependencies]
+serde_json.workspace = true
 
 # Still NOT wired in — §3 wants engine crates behind feature flags, lazy-loaded:
 # opspilot-core-sftp  = { path = "../core-sftp",  optional = true }

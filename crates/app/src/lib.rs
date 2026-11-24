@@ -3,6 +3,7 @@
 //! Everything the webview can invoke lives here; `src-tauri` is only the binary
 //! that owns `tauri.conf.json` and registers these.
 
+pub mod clipboard;
 pub mod forwards;
 pub mod localfs;
 pub mod remote;
@@ -33,6 +34,9 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         session_resize,
         session_scroll,
         session_close,
+        session_paste,
+        session_paste_text,
+        clipboard_write,
         list_shells,
         ssh_connect,
         ssh_disconnect,
@@ -128,6 +132,41 @@ fn session_scroll(id: SessionId, delta: i64) -> Result<usize, String> {
 #[tauri::command]
 fn session_close(id: SessionId) -> Result<(), String> {
     registry().close(id)
+}
+
+/// Paste the system clipboard (or PRIMARY) into these sessions.
+///
+/// The text is read and written here, natively — it is never returned to the
+/// webview. See `clipboard.rs` for why that matters. Errors with
+/// `clipboard::UNSUPPORTED` where there is no native clipboard; the frontend
+/// then reads `navigator.clipboard` and calls `session_paste_text`.
+#[tauri::command]
+async fn session_paste(
+    app: tauri::AppHandle,
+    ids: Vec<SessionId>,
+    selection: clipboard::Selection,
+) -> Result<(), String> {
+    match clipboard::read(&app, selection).await? {
+        Some(text) => clipboard::paste_into(&ids, &text),
+        None => Ok(()),
+    }
+}
+
+/// Paste text the webview already has (the non-Linux fallback). Same encoding
+/// as `session_paste`: line endings and bracketed paste are decided here.
+#[tauri::command]
+fn session_paste_text(ids: Vec<SessionId>, text: String) -> Result<(), String> {
+    clipboard::paste_into(&ids, &text)
+}
+
+/// Put a terminal selection on the clipboard or PRIMARY.
+#[tauri::command]
+async fn clipboard_write(
+    app: tauri::AppHandle,
+    selection: clipboard::Selection,
+    text: String,
+) -> Result<(), String> {
+    clipboard::write(&app, selection, text).await
 }
 
 /* ---- Remote: SSH and SFTP ------------------------------------------------- */
@@ -504,7 +543,16 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("])").next())
             .expect("command list not found");
-        for banned in ["vault_get", "vault_read", "vault_reveal", "vault_export"] {
+        for banned in [
+            "vault_get",
+            "vault_read",
+            "vault_reveal",
+            "vault_export",
+            // Same class: the clipboard routinely holds a copied password.
+            // Paste is `session_paste`, which reads and writes natively.
+            "clipboard_read",
+            "clipboard_get",
+        ] {
             assert!(
                 !handler.contains(banned),
                 "`{banned}` is registered as a command — the webview must never be                  able to read a secret back out of the vault (CLAUDE.md §12.3)"

@@ -29,7 +29,7 @@ pub use grid::{Cursor, Grid};
 pub use params::Params;
 pub use parser::{Parser, Perform};
 pub use predict::{Prediction, Predictor};
-pub use screen::Screen;
+pub use screen::{Modes, Screen};
 pub use scrollback::{Row, Scrollback};
 pub use style::{Style, StyleId, StyleTable};
 pub use width::char_width;

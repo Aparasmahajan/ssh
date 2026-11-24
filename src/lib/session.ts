@@ -41,6 +41,10 @@ export interface Snapshot {
   scroll_offset: number;
   /** How far back scrolling can go. */
   scroll_max: number;
+  /** DECCKM: arrows must be sent as `ESC O A`, not `ESC [ A`. */
+  app_cursor: boolean;
+  /** DECTCEM. False while a full-screen program has hidden the cursor. */
+  cursor_visible: boolean;
 }
 
 /** A shell this machine can actually start. */
@@ -69,3 +73,44 @@ export const scrollSession = (id: number, delta: number) =>
 export const closeSession = (id: number) => invoke<void>("session_close", { id });
 
 export const listShells = () => invoke<ShellInfo[]>("list_shells");
+
+/* ---- Clipboard ------------------------------------------------------------- */
+
+/** `primary` is the X11/Wayland select-to-copy, middle-click-to-paste buffer. */
+export type ClipboardSelection = "clipboard" | "primary";
+
+/** The exact error the Rust side returns where it has no native clipboard. */
+const UNSUPPORTED = "clipboard: unsupported";
+
+/**
+ * Paste into these sessions.
+ *
+ * On Linux the clipboard is read in Rust and written straight to the PTY — the
+ * text never comes back over IPC, so a compromised webview cannot read whatever
+ * password the user last copied (CLAUDE.md §18.14). Elsewhere the native side
+ * declines and this falls back to the web clipboard API; Rust still decides
+ * line endings and bracketed paste either way.
+ */
+export async function pasteInto(ids: number[], selection: ClipboardSelection): Promise<void> {
+  if (ids.length === 0) return;
+  try {
+    await invoke<void>("session_paste", { ids, selection });
+  } catch (e) {
+    if (String(e) !== UNSUPPORTED) throw e;
+    // PRIMARY is an X11/Wayland concept; there is nothing to fall back to.
+    if (selection === "primary") return;
+    const text = await navigator.clipboard.readText();
+    await invoke<void>("session_paste_text", { ids, text });
+  }
+}
+
+/** Copy text out of the terminal. PRIMARY is a no-op where it does not exist. */
+export async function copyText(text: string, selection: ClipboardSelection): Promise<void> {
+  if (text === "") return;
+  try {
+    await invoke<void>("clipboard_write", { selection, text });
+  } catch (e) {
+    if (String(e) !== UNSUPPORTED) throw e;
+    if (selection === "clipboard") await navigator.clipboard.writeText(text);
+  }
+}

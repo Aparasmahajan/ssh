@@ -1210,6 +1210,130 @@ didn't.
 
 ---
 
+## Phase 13 — Linux
+
+Everything before this was built and run on Windows. The Rust already had
+`#[cfg(unix)]` arms (agent socket, mode bits, PTY via `openpty`), but nothing
+had been looked at from a Linux desktop. What was wrong, by consequence:
+
+| Fix | Where | What happened without it |
+|---|---|---|
+| `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=OpsPilot`; strip `KITTY_*`/`VTE_VERSION`/… | `app/src/session.rs` | Launched from a desktop icon the shell got **no `TERM`** — no colour, `clear` fails, vim degrades. Launched from kitty it inherited `xterm-kitty` and emitted sequences for a terminal this is not. Windows never noticed: ConPTY ignores `TERM`. |
+| PTY read retries `EINTR` | `app/src/session.rs` | `Err(_) => break` treated a signal landing mid-read as the session ending. |
+| Shell list from `/etc/shells`, deduped by canonical path, `nologin`/`tmux`/`rbash` excluded | `app/src/shells.rs` | Hardcoded `/bin/zsh` beside `$SHELL=/usr/bin/zsh` offered **zsh twice** on every usr-merged distro; `/usr/bin/fish` missed fish elsewhere. |
+| State dir is `$XDG_STATE_HOME` (`~/.local/state/opspilot`) | `core-store/src/paths.rs` | Was `~/.local/share`, which XDG reserves for user data. Windows/macOS unchanged. |
+| `portable()` matches `$HOME` on a component boundary | `core-store/src/paths.rs` | With `$HOME=/home/al`, `/home/alice/key` was stored as `~ice/key`. All platforms; found here. |
+| `portable()` rewrites `\` only on Windows | `core-store/src/paths.rs` | On Unix `\` is a filename character; rewriting it points at a different file. |
+| Atomic write fsyncs the parent directory on Unix | `core-store/src/paths.rs` | ext4/XFS can roll back a rename after power loss until the directory is synced. §12.2's "a crash mid-write must not cost the user their host list" was only half true. |
+| Local pane follows symlinks | `app/src/localfs.rs` | `/bin`, `/lib` and dotfile-managed `~/.config` entries showed as `symlink` and could not be opened. Dangling links still show as `symlink`. |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1` **only** when `/proc/driver/nvidia` exists | `src-tauri/src/main.rs` | Proprietary NVIDIA + WebKitGTK gives a blank window (X11) or `Error 71` (Wayland). Not applied on Mesa, where DMA-BUF is the faster path. |
+| `.deb` section, desktop category, hi-DPI icon | `tauri.conf.json` | `.desktop` file had no category, so launchers filed it under "Other". |
+| `npm run doctor` checks `cc`, `pkg-config`, WebKitGTK 4.1 / libsoup3 / GTK3 via pkg-config, with the install command for apt/dnf/pacman/zypper | `scripts/doctor.mjs` | `webkit2gtk-sys` panics in its build script with a pkg-config error that does not name the package to install. |
+
+### Verified
+
+On Kali rolling (Debian family, X11, no NVIDIA), rustc 1.100.0, WebKitGTK 2.52:
+
+- `cargo test --workspace` — **214 passed, 0 failed**, including the new
+  `a_sibling_of_home_is_not_collapsed_to_tilde`,
+  `backslash_is_a_filename_character_on_unix`, `no_binary_is_offered_twice`
+  and `non_interactive_entries_are_never_offered`. The first two would have
+  failed against the old `portable()`.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, after one
+  fix: clippy 1.100 adds `manual_slice_fill`, which flagged the two dirty-bitset
+  loops in `core-term/src/grid.rs`. Now `.fill()`; same codegen, 101 core-term
+  tests still pass.
+- `npm run build`, `npm run lint` — clean.
+- `npx tauri build` — release binary (8.6 MB, fat LTO) plus `.deb`, `.rpm` and
+  AppImage. The `.deb` carries `Section: net`,
+  `Depends: libwebkit2gtk-4.1-0, libgtk-3-0`, and `Categories=Development;`.
+- The release binary launches: a 1600×1000 `OpsPilot` window appears under
+  X11, and it runs with nothing on stderr.
+- `npm run doctor` detects the distro and prints `apt` commands.
+
+**Not exercised:** a terminal session inside the window, the shell picker, the
+local pane following symlinks, Wayland, and the NVIDIA workaround (this machine
+has no NVIDIA driver, so that code path did not run). Those need a person at the
+window.
+
+Setup gotcha: on a rolling distro, `apt install` 404s until `apt update`
+refreshes a stale package index. And `sudo` cannot prompt from a TTY-less
+shell, so the install has to be run in a real terminal.
+
+### NOT done
+
+- No Flatpak/Snap manifest. `.deb`, `.rpm` and AppImage come from `tauri build`.
+- The two items that were listed here (no clipboard; Ctrl+B/K stolen from the
+  shell) are done in Phase 14.
+
+---
+
+## Phase 14 — Linux: the input side
+
+Phase 13 made the app start correctly on Linux. This phase makes it usable as a
+terminal there. Every item below is something a Linux user would hit within
+minutes. Most were also wrong on Windows but **hidden by ConPTY**, which tracks
+terminal modes and re-encodes input itself. A raw Unix PTY does none of that.
+
+| Fix | Where | What happened without it |
+|---|---|---|
+| **App chords are Ctrl+Shift off macOS** (D-24) | `lib/platform.ts`, `AppShell`, `SessionTabs` | **Ctrl+W closed the session** mid-command instead of deleting a word. Ctrl+K (kill-line), Ctrl+B (tmux prefix) and Ctrl+I (= Tab) never reached the shell. |
+| **DECCKM tracked and honoured** | `core-term/screen.rs`, `lib/keys.ts` | Arrows always sent `ESC[A`. ncurses (htop, nano, mc, tig) enables application-cursor mode via terminfo `smkx` and then only recognises `ESC OA`. **zsh sets it at every prompt** (found by a test that assumed it would be off). |
+| DECSET parameter lists | `screen.rs` | `ESC[?1;1049h` applied only the first mode. |
+| RIS restores input modes | `screen.rs` | `reset` after a crashed TUI left arrows in application mode at the prompt. |
+| Cursor hidden on `?25l` | `screen.rs`, `session.rs`, `TerminalSurface` | An amber block sat on whichever cell vim/htop last drew. Also hidden while scrolled back. |
+| **Selection** — drag, double-click word, triple-click line, Shift+click extend | `TerminalSurface` | No way to select terminal text at all. Drawn on a separate overlay canvas, so damage repaints never erase it. |
+| **Copy/paste** — Ctrl+Shift+C/V, Ctrl/Shift+Insert, select→PRIMARY, middle-click pastes PRIMARY | `app/src/clipboard.rs`, `lib/session.ts` | No clipboard on any platform. Linux uses the window's GTK clipboard (X11 + native Wayland). See D-25. |
+| **Bracketed paste**, with embedded `ESC[201~` stripped | `session.rs::paste_bytes` | Pasted text containing a newline would execute. Hostile clipboard text could close the bracket early. |
+| Paste line endings → CR | `paste_bytes` | CRLF from a Windows-sourced clipboard pressed Enter twice. |
+| xterm modifier encoding: Ctrl+←/→ = `ESC[1;5D/C`, Shift+Tab = `ESC[Z`, Alt+Backspace, Ctrl+Backspace, modified F-keys | `keys.ts` | Ctrl+←/→ (word jump) sent a plain arrow. Shift+Tab sent Tab. |
+| AltGr characters typed | `keys.ts` | Windows reports AltGr as Ctrl+Alt, so `@` on a German layout was **dropped**. |
+| Ctrl+letter by physical key on non-Latin layouts | `keys.ts`, `platform.ts` | Ctrl+C did nothing on a Cyrillic layout. |
+| IME composition ignored | `keys.ts` | Keys mid-composition were sent to the shell. |
+| Font zoom no longer steals Ctrl+_ (readline undo) | `state/settings.ts` | |
+| Font zoom changed size **twice** per press in a terminal | `AppShell` | Both the window and terminal handlers acted on it. |
+| Esc in a zoomed terminal no longer unzooms | `AppShell` | Every Esc in vim kicked the pane out of zoom. |
+| Tab cycling: Ctrl+PageUp/Down; ⌘⇧[ ] matched by `code` | `SessionTabs` | Shift+[ arrives as `{` on most layouts, so the old check never fired. |
+| **New tabs closed the instant they opened** | `PaneTree.tsx` | On first render `tree` is `undefined` (`ensure` has not run), and the close-when-empty effect fired in the same commit with that stale value. **No terminal could be started at all.** Pre-existing in the committed code; Phase 13 never opened a session. Now closes only once a tree has existed. |
+| `bench:filter` and the new `test:keys` run through esbuild | `package.json` | Debian/Kali's `nodejs` is built **without TypeScript stripping** (`process.features.typescript === false`), so `node script.ts` fails. |
+
+### Verified
+
+- `cargo test --workspace`: **227 passed**, 0 failed (was 214). New tests:
+  - four for modes in `core-term`, including DECSET lists, ANSI-vs-private, and RIS;
+  - `paste_bytes`: line endings, wrapping, the bracket-escape attack, partial markers;
+  - two **through a real PTY**. `modes_set_by_the_program_reach_the_snapshot` runs
+    `sh -c` with `printf`. `a_paste_reaches_the_program_bracketed` puts the PTY in raw
+    mode and reads back the exact bytes with `od`: start marker, one CR for a CRLF,
+    end marker;
+  - three for `clipboard`, plus `no_command_returns_a_secret` extended to ban
+    `clipboard_read`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `npm run test:keys`: 8 passed. Covers DECCKM, modifier encoding, the formerly
+  stolen Ctrl+letters, the Cyrillic layout, AltGr, IME, and the chord rules.
+- `npm run typecheck`, `npm run lint`, `npm run build`: clean.
+- **In the real app**, debug build in a nested Xephyr display (`:99`). Isolated:
+  synthetic input and its clipboard cannot reach the desktop. Each item was checked
+  by a file the shell wrote, by `xclip -o`, or by a screenshot:
+  - `Ctrl+W` deletes a word and the session survives. `Ctrl+K`, `Ctrl+B`,
+    `Ctrl+←` and `Ctrl+I` (Tab completion) all edit the line as a shell expects.
+  - With `?1h` set, Up arrives as `033 O A`; without it, as `033 [ A`.
+  - `Ctrl+Shift+V` pastes. A pasted **two-line command did not run** until Enter
+    (bracketed paste), then both lines ran.
+  - Double-click puts the word on PRIMARY. `Ctrl+Shift+C` copies to CLIPBOARD,
+    which is not touched before that. Middle-click pastes PRIMARY. Triple-click
+    takes the row, and a drag spans rows.
+  - `?25l` hides the cursor (0 cursor pixels) and `?25h` restores it.
+  - One `Ctrl+=` steps the font once (12.5 → 13.5). `Ctrl+Shift+E` toggles the
+    tree. `Ctrl+Shift+W` closes the session.
+  - Box-drawing in the zsh prompt renders. On Linux, canvas falls back per glyph
+    to the system monospace, so Pending 5.1's tofu does not show here.
+- Xephyr has no DRI3, so it needs `WEBKIT_DISABLE_DMABUF_RENDERER=1`, and with no
+  window manager mouse clicks need the window focused first. Neither applies on a
+  normal desktop.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1254,7 +1378,9 @@ Ordered by what it costs to not have.
 | 3.5 | **Cipher/kex readout** shows `n/a`. russh 0.62's `kex_done` takes a `negotiation::Names` that is private, so the override does not compile. | §0.5 |
 | 3.6 | **`rkyv` index cache.** Config is reparsed every launch. Irrelevant at current host counts; §12.4 is about 10,000. | §12.4 |
 | 3.7 | **Hot reload.** Editing `production.toml` in Vim should make hosts appear. §12.2 calls this "a real differentiator and it costs almost nothing" — it needs a `notify` watcher. | §12.2 |
-| 3.8 | **Mouse reporting, selection, clipboard.** | — |
+| 3.8 | **Mouse reporting** (`?1000`/`?1002`/`?1006`). Selection and clipboard are done (Phase 14). Without reporting, clicks in htop/mc/vim `mouse=a` select text instead of reaching the program. | — |
+| 3.9 | **Selection is viewport-anchored.** It clears on scroll or resize rather than following the text into scrollback, and soft-wrapped lines copy as separate lines. | — |
+| 3.10 | **No IME input.** Composition is ignored correctly, but committed CJK text has no path to the PTY: the terminal is a canvas, not an input element. | — |
 
 ### 4. Small and self-contained
 
