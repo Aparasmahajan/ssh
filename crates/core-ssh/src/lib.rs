@@ -20,4 +20,8 @@ pub use forward::{Forward, ForwardKind, ForwardStats};
 pub use hostkey::{HostKeyPolicy, Verdict};
 pub use sftp::{Entry, EntryKind, Sftp};
 pub use agent::AgentStatus;
+/// Re-exported so the transfer engine names exactly these types, with the
+/// features chosen here, rather than resolving its own copy.
+pub use russh;
+pub use russh_sftp;
 pub use transport::{AuthMethod, Endpoint, Negotiated, Shell, SshError, Timeouts, Transport};

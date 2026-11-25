@@ -808,3 +808,35 @@ Two more lessons from the same work:
   the last one only on its fourth run. Run it after any predictor change, more
   than once. When writing a regression test from a live failure, reproduce the
   **chunking** too: the queue-cap bug needs the echo and the prompt in one read.
+
+### 18.22 `russh-sftp`'s `FileAttributes::default()` is not "no attributes"
+
+It is **size 0, uid 0, gid 0, mode `0o777|DIR`, atime/mtime 0**. Sent as the
+attributes of an `fsetstat`, it truncated every upload to zero bytes; sent with
+`open(CREATE)` or `mkdir`, it asks for mode 0777, and only the server's umask
+stands between that and a world-writable file. The crate's own high-level API
+uses `FileAttributes::empty()`, which sends nothing. Use `empty()` and set
+fields on it — never `..Default::default()` on this type. Same lesson as §18.1:
+read the library's defaults, they are not the safe value.
+
+### 18.23 Two windows cap SFTP throughput, and only one is ours
+
+Measured through a 40 ms RTT proxy against OpenSSH (`core-sftp/tests/sshd.rs`):
+
+- **Our receive window (downloads).** russh refills a channel window only once
+  it drops below half, so between half and all of it is in flight: the window
+  must be about **2× the bandwidth-delay product**. At 8 MiB downloads stopped
+  at 81 MB/s whatever the SFTP request window; at 32 MiB, 219 MB/s. §6.1's
+  "≥ 8 MB" is a floor, not a target.
+- **The server's receive window (uploads).** OpenSSH advertises 2 MiB per
+  channel and the client cannot change it: one channel uploads at most
+  ~50 MB/s at 40 ms (measured 41). Every channel has its own window, so a large
+  upload is **striped over 8 channels** writing disjoint ranges of one part
+  file: 129 MB/s. This is §1's "the protocol is the limit" pattern again.
+- AIMD from 16 at +1 per round trip ramps too slowly for transfers lasting tens
+  of round trips. Slow start (double per round trip until the first stall),
+  bounded by the BDP ceiling, took a 128 MiB download from 110 to 195 MB/s.
+
+When a pipeline stops scaling, test a deep **fixed** window first: if that does
+not move the number either, the limit is not the window you are tuning.
+

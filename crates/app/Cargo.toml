@@ -20,6 +20,10 @@ opspilot-core-term = { path = "../core-term" }
 opspilot-core-ssh = { path = "../core-ssh" }
 opspilot-core-store = { path = "../core-store" }
 opspilot-core-docker = { path = "../core-docker" }
+# The transfer engine (§6). Not feature-gated, for the reason given for
+# core-ssh above: SFTP is part of remote access. New code: core-sftp itself and
+# the `tar` crate (pure Rust, no default features). Nothing runs at startup.
+opspilot-core-sftp = { path = "../core-sftp" }
 opspilot-core-db = { path = "../core-db" }
 opspilot-core-kube = { path = "../core-kube" }
 # Only for the `kube::Client` type held in the per-context cache; the version
@@ -56,5 +60,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "
 opspilot-test-sshd = { path = "../test-sshd" }
 
 # Still NOT wired in — §3 wants engine crates behind feature flags, lazy-loaded:
-# opspilot-core-sftp  = { path = "../core-sftp",  optional = true }
 # opspilot-render     = { path = "../render",     optional = true }

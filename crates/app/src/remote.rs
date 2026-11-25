@@ -129,7 +129,11 @@ impl ConnectRequest {
         if let Some(p) = &self.auth.key_path {
             if !p.is_empty() {
                 v.push(AuthMethod::PrivateKey {
-                    path: p.into(),
+                    // §12.2: config stores `~/.ssh/id_ed25519`, never an
+                    // absolute path. It has to be resolved here, or every saved
+                    // host with a key fails with "~/.ssh/...: No such file"
+                    // (found in the GUI test of the transfer queue).
+                    path: opspilot_core_store::paths::resolve(p).into(),
                     passphrase,
                 });
             }
@@ -452,6 +456,30 @@ mod tests {
         assert!(matches!(m[1], AuthMethod::Agent), "agent goes between key and password");
         assert!(matches!(m[2], AuthMethod::Password(_)));
         assert_eq!(m.len(), 3);
+    }
+
+    /// §12.2's portable form must reach the key loader as a real path.
+    #[test]
+    fn a_portable_key_path_is_resolved_against_home() {
+        let req = ConnectRequest {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity: "i".into(),
+            auth: AuthSpec {
+                password: None,
+                key_path: Some("~/.ssh/id_ed25519".into()),
+                passphrase: None,
+                password_ref: None,
+                passphrase_ref: None,
+                use_agent: Some(false),
+            },
+            host_key_policy: None,
+        };
+        let m = req.methods().unwrap();
+        let AuthMethod::PrivateKey { path, .. } = &m[0] else { panic!("{m:?}") };
+        assert!(!path.to_string_lossy().starts_with('~'), "not expanded: {}", path.display());
+        assert!(path.ends_with(".ssh/id_ed25519"), "{}", path.display());
     }
 
     #[test]

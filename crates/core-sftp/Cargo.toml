@@ -6,8 +6,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# No dependencies yet, deliberately. CLAUDE.md §16: "No new dependency without a
-# note on binary size and cold-start impact" — and §3 requires the engine crates
-# to sit behind feature flags and lazy-load, so russh/wgpu/arrow arrive with the
-# code that uses them, not before it.
+# CLAUDE.md §16: a note on every dependency's size and cold-start cost.
+#
+#   opspilot-core-ssh — the transport and channels; also re-exports russh and
+#                  russh-sftp so this crate names exactly those types.
+#   tokio, futures-util — already in the binary through core-ssh.
+#   tar        — NEW. Pure Rust, no default features (no xattr), ~60 KB of
+#                code. The local half of §6.2's tar-pipe; the alternative is
+#                shelling out to a system tar, which Windows only has on 1803+,
+#                and whose extraction safety we would not control.
+#
+# Nothing here runs at startup: the engine is entered on the first transfer.
 [dependencies]
+opspilot-core-ssh = { path = "../core-ssh" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "fs", "io-util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tar = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util", "net"] }
+opspilot-test-sshd = { path = "../test-sshd" }

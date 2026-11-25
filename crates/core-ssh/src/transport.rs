@@ -22,7 +22,17 @@ pub struct ForwardedConnection {
 /// §6.1: "Widen the SSH channel window too. `russh` defaults are small (~2 MB or
 /// less); a narrow channel window stalls you no matter how deep the SFTP pipeline
 /// is. Set it to ≥ 8 MB and adjust proactively, not lazily."
-const WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+///
+/// 32 MiB, measured. russh refills a window only once it falls below half, so
+/// the server can have between half and all of it in flight: the window must
+/// be about twice the bandwidth-delay product. At 8 MiB an SFTP download
+/// through a 40 ms RTT link stopped at 81 MB/s whatever the request window
+/// (fixed at 128 requests: 82 MB/s); at 32 MiB it reached 219 MB/s
+/// (`core-sftp/tests/sshd.rs`). That covers 1 Gb/s to ~100 ms RTT.
+///
+/// It is not a buffer: what russh holds per channel is bounded by its channel
+/// queue, and TCP pushes back beyond that.
+const WINDOW_SIZE: u32 = 32 * 1024 * 1024;
 const MAX_PACKET: u32 = 64 * 1024;
 
 /// Server-opened connections for one remote forward that have not been picked
@@ -471,6 +481,41 @@ impl Transport {
             )
             .await
             .map_err(|e| SshError::Channel(e.to_string()))
+    }
+
+    /// A raw channel with the SFTP subsystem started, for the transfer engine
+    /// (`core-sftp`), which drives `RawSftpSession` itself so it can keep many
+    /// requests in flight (§6.1). §8.1: a channel, not a connection.
+    pub async fn open_sftp_channel(&self) -> Result<Channel<Msg>, SshError> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+        Ok(channel)
+    }
+
+    /// Run `command` on the server over a new channel, without a PTY. The
+    /// caller owns the channel: stdin via its write half, stdout, stderr and the
+    /// exit status via its read half. Used by §6.2's tar-pipe.
+    ///
+    /// `command` goes to the remote user's shell. Quote everything that came
+    /// from a path or a user.
+    pub async fn open_exec(&self, command: &str) -> Result<Channel<Msg>, SshError> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+        Ok(channel)
     }
 
     /// Open the SFTP subsystem on its own channel over the same transport.

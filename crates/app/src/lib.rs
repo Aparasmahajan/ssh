@@ -12,6 +12,7 @@ pub mod localfs;
 pub mod remote;
 pub mod session;
 pub mod shells;
+pub mod transfers;
 pub mod vault;
 
 use session::{registry, SessionId, Snapshot};
@@ -73,8 +74,10 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         sftp_mkdir,
         sftp_rename,
         sftp_remove,
-        sftp_download,
-        sftp_upload,
+        transfer_start,
+        transfer_list,
+        transfer_cancel,
+        transfer_clear,
         local_home,
         local_list,
         local_mkdir,
@@ -476,32 +479,34 @@ async fn sftp_remove(key: String, path: String, is_dir: bool) -> Result<(), Stri
 
 /* ---- Transfers ------------------------------------------------------------ */
 
-/// Remote -> local.
-///
-/// Whole-file for now. CLAUDE.md §6.1's AIMD pipelining and §6.2's tar-pipe both
-/// belong to the transfer *queue*, which does not exist yet; this is the browser
-/// action, and it is honest about being one file at a time.
+/// Queue a transfer (§6). In-memory and a spawn, so synchronous is fine
+/// (§18.19). `source` is remote for a download, local for an upload;
+/// `target_dir` is the directory it lands in on the other side.
 #[tauri::command]
-async fn sftp_download(key: String, remote: String, local: String) -> Result<u64, String> {
-    blocking(move || {
-        let bytes = remote::sftp_read(&key, &remote)?;
-        let n = bytes.len() as u64;
-        localfs::write(&local, &bytes)?;
-        Ok(n)
-    })
-    .await
+fn transfer_start(
+    key: String,
+    direction: transfers::Direction,
+    source: String,
+    target_dir: String,
+    overwrite: bool,
+) -> Result<u64, String> {
+    transfers::start(&key, direction, &source, &target_dir, overwrite)
 }
 
-/// Local -> remote.
+/// Every transfer, sampled by the UI at 10 Hz (§13.1 rule 8). Atomics only.
 #[tauri::command]
-async fn sftp_upload(key: String, local: String, remote: String) -> Result<u64, String> {
-    blocking(move || {
-        let bytes = localfs::read(&local)?;
-        let n = bytes.len() as u64;
-        remote::sftp_write(&key, &remote, bytes)?;
-        Ok(n)
-    })
-    .await
+fn transfer_list() -> Vec<transfers::TransferView> {
+    transfers::list()
+}
+
+#[tauri::command]
+fn transfer_cancel(id: u64) -> Result<(), String> {
+    transfers::cancel(id)
+}
+
+#[tauri::command]
+fn transfer_clear() {
+    transfers::clear()
 }
 
 /* ---- Local filesystem ------------------------------------------------------ */

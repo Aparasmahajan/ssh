@@ -1678,6 +1678,143 @@ Results, three consecutive runs (OpenSSH 10.6, 200 ms RTT):
 
 ---
 
+## Phase 19 — The SFTP transfer queue (§6)
+
+`crates/core-sftp` was a 20-line skeleton. It is now the transfer engine, and
+the app has a queue in front of it.
+
+### What picks the method
+
+| Request | Method | Why |
+|---|---|---|
+| one file (download) | **pipelined**: AIMD request window with slow start and a BDP ceiling (§6.1) | bounded by requests in flight, not bandwidth |
+| one file ≥ 16 MiB (upload) | **striped** over 8 channels, disjoint ranges of one part file | the *server's* per-channel window caps one channel (see below) |
+| directory, > 200 files averaging < 1 MB, server has `tar` | **tar-pipe** over an exec channel (§6.2) | ~4 round trips per file is the cost, not bytes |
+| any other directory | **parallel** SFTP, 4–8 channels, largest file first | one big file must not hold up the rest |
+
+The method is shown on every transfer row (§6.2). If `tar` is missing on the
+server, the transfer falls back to parallel SFTP and the row says so.
+
+### Measured (`core-sftp/tests/sshd.rs`, OpenSSH 10.6, 40 ms RTT proxy, no loss, release)
+
+| | result | vs WinSCP-style |
+|---|---|---|
+| download, 1 request in flight × 32 KiB (WinSCP) | 0.7 MB/s | base |
+| download 32 MiB, pipelined | 75 MB/s (includes ~6 RTT setup) | **104×** |
+| download 128 MiB, pipelined | **195 MB/s**; a fixed 128-request window: 220 | |
+| upload 128 MiB, 1 channel / 4 stripes / **8 stripes** | 41 / 96 / **129 MB/s** | |
+| local ceiling (no added latency) | download 744–832 MB/s, upload 412–616 MB/s | |
+| 2,001 × 4 KiB, sequential SFTP | 6 files/s (10k files: 29 min) | base |
+| 2,001 × 4 KiB, 8 parallel channels | 46 files/s | 8× |
+| 2,001 × 4 KiB, **tar-pipe** | **2,853 files/s** (10k files: 3.5 s) | **~500×** |
+
+§4's "≥ 30× WinSCP" for small files is met by a wide margin. §4's "≥ 90% of
+1 GbE" is **not proven**: there is no 1 GbE link here. Through 40 ms of
+latency the download reached 195 MB/s and the striped upload 129 MB/s.
+
+### Found by measuring, not by reasoning (CLAUDE.md §18.23)
+
+- **The SSH channel window was the download cap, not the request window.** At
+  8 MiB, downloads stopped at 81 MB/s whatever the SFTP window; a deep fixed
+  window of 128 requests scored the same. russh refills a window only below half,
+  so the window must be about 2× the BDP. It is now 32 MiB: 219 MB/s.
+- **The server's 2 MiB window caps one upload channel** at about 50 MB/s at
+  40 ms. The client cannot change it, but every channel has its own, so large
+  uploads are striped over 8 channels.
+- **Slow start.** Growing +1 per round trip from 16 took about 18 round trips to
+  reach 34. Doubling per round trip until the first stall, still under the BDP
+  ceiling, took a 128 MiB download from 110 to 195 MB/s.
+
+### Bugs found on the way
+
+- **`russh-sftp`'s `FileAttributes::default()`** is size 0, uid/gid 0, mode
+  `0o777|DIR` (§18.22). As `fsetstat` attributes it **truncated every upload to
+  zero bytes**; the round-trip test caught it. On `open`/`mkdir` it asks for
+  mode 0777. A check that directories are not world-writable did **not** fail
+  with the bad value, because OpenSSH applies its umask, so that check was
+  removed rather than kept as false assurance.
+- **`~` in a key path was never expanded** (pre-existing). A saved identity with
+  `key_path = "~/.ssh/id_ed25519"` (the model's own example, and §12.2's rule)
+  could not connect. Found in the GUI test; fixed with `paths::resolve`, with a
+  test.
+- **The SFTP pane hid file names** below ~400 px width (pre-existing): the `1fr`
+  name column collapsed under the fixed columns. Names now keep 120 px and the
+  pane scrolls sideways.
+- **The pane did not refresh after a fast transfer.** A job that started and
+  finished between two idle (1 Hz) samples was never seen running. Any job
+  reaching `done` now counts, and queueing a transfer wakes the list at once.
+
+### Safety
+
+- Every file goes to `.name.opspilot-part` and is renamed into place
+  (`posix-rename@openssh.com` when replacing remotely). A failed or cancelled
+  transfer leaves nothing under the real name; tested by cancelling mid-file,
+  both in the suite and from the UI.
+- An existing target is refused unless "replace" is chosen. A directory then
+  merges.
+- **Server-supplied names are validated** before use: `..`, `/`, `\`, NUL
+  and empty names are refused and counted. Tar extraction uses `unpack_in`; a
+  test feeds a hostile archive with `../escaped.txt` and asserts it lands
+  nowhere.
+- Every path in a remote command is shell-quoted; a test round-trips
+  `$(rm -rf ~)`-style strings through a real `sh`.
+- Symlinks are never followed when uploading. The SFTP path skips them
+  (counted, shown); tar preserves them as links.
+- Mode bits are kept without setuid/setgid. Windows sends no mode rather than
+  inventing one (§18.11).
+
+### The queue (`crates/app/src/transfers.rs`, `TransferList.tsx`)
+
+- At most 2 jobs run at once; the rest queue in order. Commands are in-memory
+  only (§18.19). Progress is atomics sampled at 10 Hz while active and 1 Hz idle
+  (§13.1 rule 8). Rates are a 1 s EWMA (§14.6), with ETA, files done and
+  skipped counts.
+- Directories upload and download. The old whole-file, in-memory
+  `sftp_download`/`sftp_upload` commands are gone.
+- Transfers survive a webview reload: the queue is native and the new page
+  lists it.
+
+### Verified
+
+- `cargo test --workspace`: **320 passed**, 0 failed. New: AIMD (6),
+  tar/quoting/hostile archive (5), names/paths (4), the queue (2), key-path
+  expansion (1), and against real OpenSSH (4): file round trip with mode,
+  striped upload, directory round trip by both methods, overwrite refusal, and
+  cancel. The OpenSSH tests skip where `sshd` is not installed.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- **Real app**, nested Xephyr display, isolated `HOME` and config, against a
+  throwaway sshd behind a 40 ms (then 1 s) RTT proxy:
+  - a 191 MB upload ran "striped · 8 channels" in 1.2 s (`cmp` identical, mode
+    and mtime kept);
+  - a 2,500-file directory ran "batched · tar" in 0.7 s (`diff -r` identical);
+  - downloading it onto an existing copy failed with "already exists". "Replace"
+    merged it and restored a deliberately modified file;
+  - cancel mid-download (at 1 s RTT) left neither the file nor its part file.
+- `tests/live_ssh.rs` (predictive echo) moved to the shared fixture crate
+  `crates/test-sshd`. It still passes with the 32 MiB window.
+- **Binary size: 22.9 MB (Phase 15) → 24.2 MB** (release, fat LTO, stripped).
+  That +1.3 MB is everything since Phase 15, not this phase alone; most of it is
+  likely core-sftp and `tar`, but no per-crate breakdown was taken (`cargo
+  bloat` is not installed).
+
+### Not done
+
+- **Resume** (§6.5: persist offset and prefix hash, verify before resuming).
+  A cancelled or failed transfer restarts from zero.
+- **Merkle compare / delta sync** (§6.5), **speculative listing prefetch**
+  (§6.6), **io_uring/IOCP zero-copy and a buffer pool** (§6.3). Each chunk is
+  one allocation; the local ceiling above suggests it is not yet the limit.
+- Parallel SFTP for many small files is ~4 round trips per file per channel.
+  Tar-pipe covers the case that matters; a server without `tar` gets 8×, not
+  500×.
+- The helper agent (§6.7).
+- Packet loss is not simulated; the proxy only delays. The flaky-link
+  behaviour of AIMD's halving is unit-tested, not measured.
+- Panes do not watch for outside changes (pre-existing). They refresh after a
+  transfer or on "refresh".
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1718,7 +1855,7 @@ Ordered by what it costs to not have.
 | 3.1 | **Module surfaces: REST client, Log viewer.** Docker, Kubernetes and Databases are built (Phase 15). | Steps 12–13 |
 | 3.2 | **Database TLS** (D-30), CSV export, schema browser/autocomplete. Connections are plaintext; the panel warns for remote hosts. | §11 |
 | 3.11 | **Kubernetes protobuf** (D-29) and further kinds, events, port-forward. | §10 |
-| 3.3 | **Transfer queue.** AIMD pipelining and the tar-pipe path. Directory transfers are **disabled, not silently broken**; single-file transfer works. | §6.1, §6.2 |
+| 3.3 | **Transfer resume and sync** (§6.5: resumable offsets with prefix hash, Merkle compare, delta). The queue, pipelining, striping, tar-pipe and directory transfers are done (Phase 19). | §6.5 |
 | 3.4 | **LinkStrip** — the 2px per-tab RTT sparkline. **Blocked, not merely undone:** russh exposes no way to time a round trip, and drawing it from the connect time would be decoration pretending to be telemetry. | §0.4 |
 | 3.5 | **Cipher/kex readout** shows `n/a`. russh 0.62's `kex_done` takes a `negotiation::Names` that is private, so the override does not compile. | §0.5 |
 | 3.6 | **`rkyv` index cache.** Config is reparsed every launch. Irrelevant at current host counts; §12.4 is about 10,000. | §12.4 |
