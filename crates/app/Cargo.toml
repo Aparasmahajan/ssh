@@ -50,6 +50,10 @@ libc = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true
+# Test-only: the live SSH harness (tests/live_ssh.rs). Real sshd, agent and a
+# latency proxy from the shared fixture crate; nothing reaches the binary.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util", "macros"] }
+opspilot-test-sshd = { path = "../test-sshd" }
 
 # Still NOT wired in — §3 wants engine crates behind feature flags, lazy-loaded:
 # opspilot-core-sftp  = { path = "../core-sftp",  optional = true }

@@ -23,6 +23,16 @@ export interface AuthSpec {
    */
   passwordRef?: string;
   passphraseRef?: string;
+  /** Offer the SSH agent's keys. Defaults to true, as with `ssh`. */
+  useAgent?: boolean;
+}
+
+/** What the running SSH agent holds. Public keys only. */
+export interface AgentInfo {
+  available: boolean;
+  /** `ED25519 SHA256:… comment`, one per usable key. */
+  keys: string[];
+  error: string | null;
 }
 
 export type HostKeyPolicy = "accept-new" | "strict" | "verify-only";
@@ -82,10 +92,13 @@ export const sshConnect = (request: ConnectRequest) =>
         passphrase: request.auth.passphrase ?? null,
         password_ref: request.auth.passwordRef ?? null,
         passphrase_ref: request.auth.passphraseRef ?? null,
+        use_agent: request.auth.useAgent ?? null,
       },
       host_key_policy: request.hostKeyPolicy ?? null,
     },
   });
+
+export const sshAgentStatus = () => invoke<AgentInfo>("ssh_agent_status");
 
 export const sshDisconnect = (key: string) => invoke<void>("ssh_disconnect", { key });
 export const sshConnections = () => invoke<ConnectionInfo[]>("ssh_connections");

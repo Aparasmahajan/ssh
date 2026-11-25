@@ -25,7 +25,7 @@
 //! so a host that works in a terminal works here.
 
 use russh::client::Handle;
-use russh::keys::agent::client::AgentClient;
+use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -37,19 +37,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(windows)]
 const AGENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Try every identity the agent holds. `Ok(true)` on success, `Ok(false)` if the
-/// agent answered but the server rejected all of its keys, `Err` with a reason
-/// if there is no usable agent at all.
-pub(crate) async fn authenticate<H: russh::client::Handler>(
-    handle: &mut Handle<H>,
-    user: &str,
-) -> Result<bool, String> {
+/// Any agent connection, whatever transport it came over.
+type Agent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+/// Find and connect to the running agent: `Err` with a reason if there is none.
+async fn connect() -> Result<Agent, String> {
     #[cfg(unix)]
     {
-        let agent = AgentClient::connect_env()
+        AgentClient::connect_env()
             .await
-            .map_err(|e| format!("no SSH agent (SSH_AUTH_SOCK): {e}"))?;
-        try_identities(handle, user, agent).await
+            .map(AgentClient::dynamic)
+            .map_err(|e| format!("no SSH agent (SSH_AUTH_SOCK): {e}"))
     }
 
     #[cfg(windows)]
@@ -64,14 +62,13 @@ pub(crate) async fn authenticate<H: russh::client::Handler>(
             AgentClient::connect_named_pipe(pipe.clone()),
         )
         .await;
-        match openssh {
-            Ok(Ok(agent)) => return try_identities(handle, user, agent).await,
-            Ok(Err(_)) | Err(_) => {}
+        if let Ok(Ok(agent)) = openssh {
+            return Ok(agent.dynamic());
         }
 
         // Pageant, for the PuTTY/WinSCP half of the world.
         match tokio::time::timeout(AGENT_CONNECT_TIMEOUT, AgentClient::connect_pageant()).await {
-            Ok(Ok(agent)) => try_identities(handle, user, agent).await,
+            Ok(Ok(agent)) => Ok(agent.dynamic()),
             Ok(Err(e)) => Err(format!("no SSH agent ({pipe} or Pageant): {e}")),
             Err(_) => Err(format!("SSH agent did not respond ({pipe} or Pageant)")),
         }
@@ -79,8 +76,70 @@ pub(crate) async fn authenticate<H: russh::client::Handler>(
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (handle, user);
         Err("SSH agent support is not implemented on this platform".into())
+    }
+}
+
+/// Try every identity the agent holds. `Ok(true)` on success, `Ok(false)` if the
+/// agent answered but the server rejected all of its keys, `Err` with a reason
+/// if there is no usable agent at all.
+pub(crate) async fn authenticate<H: russh::client::Handler>(
+    handle: &mut Handle<H>,
+    user: &str,
+) -> Result<bool, String> {
+    let agent = connect().await?;
+    try_identities(handle, user, agent).await
+}
+
+/// What the agent can offer, for the connect dialog. Public keys only: the
+/// agent never hands out anything else, so there is nothing secret here.
+#[derive(Clone, Debug, Default)]
+pub struct AgentStatus {
+    /// An agent answered.
+    pub available: bool,
+    /// One line per usable key: `ED25519 SHA256:… comment`.
+    pub keys: Vec<String>,
+    /// Why there is no agent, or why it would not list its keys.
+    pub error: Option<String>,
+}
+
+/// Ask the running agent what it holds. Never fails: "no agent" is a status.
+pub async fn status() -> AgentStatus {
+    let mut agent = match connect().await {
+        Ok(a) => a,
+        Err(e) => {
+            return AgentStatus {
+                error: Some(e),
+                ..Default::default()
+            }
+        }
+    };
+    match agent.request_identities().await {
+        Ok(ids) => AgentStatus {
+            available: true,
+            keys: ids
+                .iter()
+                .filter_map(|id| match id {
+                    // Certificates are not offered by `try_identities`, so
+                    // listing them would promise something that is not tried.
+                    AgentIdentity::PublicKey { key, comment } => Some(format!(
+                        "{} {} {}",
+                        key.algorithm(),
+                        key.fingerprint(Default::default()),
+                        comment
+                    )
+                    .trim_end()
+                    .to_string()),
+                    _ => None,
+                })
+                .collect(),
+            error: None,
+        },
+        Err(e) => AgentStatus {
+            available: true,
+            keys: Vec::new(),
+            error: Some(format!("the SSH agent would not list its keys: {e}")),
+        },
     }
 }
 

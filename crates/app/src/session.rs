@@ -176,13 +176,18 @@ fn now_ms() -> u64 {
 /// with nothing to force a repaint.
 fn reconcile(screen: &Screen, predictor: &mut Predictor, dirty: &mut [bool]) {
     if predictor.outstanding() == 0 {
+        // Still called: the predictor watches for output that moves the
+        // cursor while nothing is predicted (a program printing a prompt),
+        // which is what starts a new epoch. One comparison.
+        predictor.reconcile(screen, now_ms());
         return;
     }
     // Bounded by MAX_OUTSTANDING (12), so this allocation is small and only
     // happens while predictions are in flight.
     let touched: Vec<usize> = predictor.overlay().map(|o| o.row).collect();
     predictor.reconcile(screen, now_ms());
-    for r in touched {
+    // Rows a confirmation just revealed are dirty too.
+    for r in touched.into_iter().chain(predictor.overlay().map(|o| o.row)) {
         if let Some(slot) = dirty.get_mut(r) {
             *slot = true;
         }
@@ -795,7 +800,9 @@ impl Session {
             bracketed_paste: is_paste(bytes),
         };
         let made = predictor.on_input(screen, &ctx, bytes, now_ms());
-        if made > 0 {
+        // Held (tentative) predictions draw nothing, so there is nothing to
+        // repaint for them; `cursor()` is `Some` only when something is drawn.
+        if made > 0 && predictor.cursor().is_some() {
             for o in predictor.overlay() {
                 if let Some(slot) = dirty.get_mut(o.row) {
                     *slot = true;
@@ -807,6 +814,33 @@ impl Session {
             self.generation.fetch_add(1, Ordering::Release);
         }
         made
+    }
+
+    /// Let prediction timeouts fire on a link that has gone quiet.
+    ///
+    /// The reader reconciles after each chunk of output, so without this a
+    /// prediction the server never answers would stay drawn until some output
+    /// happened to arrive. Runs from the frame poll; takes the lock only while
+    /// something is outstanding, which is only while someone is typing.
+    fn expire_predictions(&self) {
+        if !self.remote {
+            return;
+        }
+        let Ok(mut g) = self.inner.lock() else { return };
+        if g.predictor.outstanding() == 0 {
+            return;
+        }
+        let before = (g.predictor.outstanding(), g.predictor.overlay().count());
+        let Inner {
+            screen,
+            predictor,
+            dirty,
+            ..
+        } = &mut *g;
+        reconcile(screen, predictor, dirty);
+        if (g.predictor.outstanding(), g.predictor.overlay().count()) != before {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Prediction telemetry, or `None` where prediction is not running.
@@ -823,6 +857,7 @@ impl Session {
             missed: s.missed,
             timed_out: s.timed_out,
             flushes: s.flushes,
+            withheld: s.withheld,
             outstanding: g.predictor.outstanding(),
             disabled: s.disabled_for_session,
             echo_off: g.predictor.echo_appears_disabled(),
@@ -929,6 +964,10 @@ impl Session {
                 g.full_repaint = true;
                 self.generation.fetch_add(1, Ordering::Release);
             }
+            // A paste can hold Enter, and it never passes through the
+            // predictor: start a new epoch so nothing typed after it is drawn
+            // before the server has shown it is echoing (§5.5).
+            g.predictor.interrupt();
             g.screen.modes().bracketed_paste
         };
         self.send(&paste_bytes(text, bracketed))
@@ -1064,6 +1103,7 @@ impl Session {
         if self.step_reflow() {
             self.generation.fetch_add(1, Ordering::Release);
         }
+        self.expire_predictions();
 
         let generation = self.generation.load(Ordering::Acquire);
         if generation == since {
@@ -1292,6 +1332,10 @@ pub struct PredictionStat {
     pub timed_out: u32,
     /// Times the queue was discarded whole after a mismatch.
     pub flushes: u32,
+    /// Tentative predictions resolved without being drawn: the first keys of
+    /// each line, and anything typed at a prompt with echo off. Not in the
+    /// hit rate, because nothing was ever on screen.
+    pub withheld: u32,
     pub outstanding: usize,
     /// The predictor judged this link unpredictable and stopped (§5.5's 85%).
     pub disabled: bool,
@@ -1901,6 +1945,33 @@ mod tests {
                 enabled: true,
                 underline_unconfirmed: false,
             });
+            let start = g.screen.grid().cursor;
+
+            // A fresh epoch: the first key is held until the server echoes it.
+            assert_eq!(session.predict(&mut g, b"Y"), 1);
+            drop(g);
+            let held = session.snapshot(0).unwrap().expect("a snapshot");
+            assert_eq!(
+                (held.cursor_row, held.cursor_col),
+                (start.row, start.col),
+                "a held prediction moved the caret"
+            );
+            let line = held.lines.iter().find(|l| l.row == start.row).unwrap();
+            assert_ne!(line.text.chars().nth(start.col), Some('Y'), "a held prediction was drawn");
+
+            // Stand in for the echo: put the 'Y' in the authoritative grid as
+            // the server would, and reconcile. That confirms the epoch.
+            let mut g = session.inner.lock().unwrap();
+            let Inner {
+                screen,
+                parser,
+                predictor,
+                dirty,
+                ..
+            } = &mut *g;
+            parser.advance(screen, b"Y");
+            reconcile(screen, predictor, dirty);
+            assert_eq!(predictor.outstanding(), 0);
             let c = g.screen.grid().cursor;
             drop(g);
             let s = session.snapshot(0).unwrap().expect("a baseline snapshot");

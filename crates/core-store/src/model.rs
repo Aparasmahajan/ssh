@@ -47,10 +47,25 @@ pub struct Identity {
     /// and a host can need both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passphrase_ref: Option<String>,
+    /// Offer the keys held by the running SSH agent. On by default, as with
+    /// `ssh`: it needs no prompt, and the private key never leaves the agent.
+    /// Off for a host that must use exactly `key_path`, or where a long agent
+    /// key list would exhaust the server's `MaxAuthTries` before the right
+    /// method is reached. Omitted from the file while on.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub use_agent: bool,
     /// Read-only identities disable mutating SFTP controls rather than hiding
     /// them (§Step 10).
     #[serde(default)]
     pub read_only: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -179,6 +194,7 @@ mod tests {
                     key_path: Some("~/.ssh/id_ed25519".into()),
                     password_ref: None,
                     passphrase_ref: None,
+                    use_agent: true,
                     read_only: false,
                 }],
                 forwards: vec![Forward {
@@ -194,6 +210,23 @@ mod tests {
                 jump_host: None,
             }],
         }
+    }
+
+    /// Agent auth is on unless switched off, and a file written before the
+    /// field existed reads as on. The field only appears in TOML when off, so
+    /// existing workspace files do not churn.
+    #[test]
+    fn use_agent_defaults_on_and_is_written_only_when_off() {
+        let old = "id = \"i\"\nname = \"deploy\"\nuser = \"deploy\"\n";
+        let idn: Identity = toml::from_str(old).unwrap();
+        assert!(idn.use_agent);
+        assert!(!toml::to_string(&idn).unwrap().contains("use_agent"));
+
+        let off = Identity { use_agent: false, ..idn };
+        let text = toml::to_string(&off).unwrap();
+        assert!(text.contains("use_agent = false"), "{text}");
+        let back: Identity = toml::from_str(&text).unwrap();
+        assert!(!back.use_agent);
     }
 
     #[test]

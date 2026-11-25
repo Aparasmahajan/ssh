@@ -19,4 +19,5 @@ pub mod transport;
 pub use forward::{Forward, ForwardKind, ForwardStats};
 pub use hostkey::{HostKeyPolicy, Verdict};
 pub use sftp::{Entry, EntryKind, Sftp};
+pub use agent::AgentStatus;
 pub use transport::{AuthMethod, Endpoint, Negotiated, Shell, SshError, Timeouts, Transport};

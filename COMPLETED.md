@@ -1588,6 +1588,96 @@ All four items are closed by Phase 17, except live-testing the Kubernetes exec.
 
 ---
 
+## Phase 18 — Predictive echo on a real link, and SSH agent auth
+
+### Agent auth
+
+`core-ssh` could already authenticate through an agent, but the app never
+offered it: `remote.rs` built only a key-file method and a password method.
+
+- Order is now **configured key → agent → password**. A configured key goes
+  first because each rejected agent key counts against the server's
+  `MaxAuthTries`.
+- `Identity::use_agent` defaults to on, as with `ssh`, and is written to TOML
+  only when off, so existing workspace files do not change.
+- The connect dialog shows whether an agent is running and how many keys it
+  holds (`ssh_agent_status`: public keys and comments only). The host editor
+  has a per-identity toggle.
+- Agent discovery is one function shared by auth and status (`agent::connect`,
+  type-erased with `AgentClient::dynamic`). The Windows branch is unchanged
+  apart from `.dynamic()`; no Windows target is installed here, so it was not
+  compiled.
+
+### Predictive echo: wired, then fixed
+
+The predictor was already in the SSH session path (`write` → `predict`, output →
+`reconcile`). Pending 1.6 was stale on that point, but the feature had never run
+over a real link. The new live harness (below) ran it, and found three bugs:
+
+| Bug found live | Fix |
+|---|---|
+| **Every character typed at a password prompt was drawn** (`read -s`: 9 of 9). Echo-off was inferred from timeouts, but timeouts were only checked when output arrived, and a password prompt sends none. | **Epochs** (Mosh's rule). After Enter, any key that is not predicted, a paste, a mismatch, a resize, or output that moved the cursor with nothing predicted, new predictions are **held**: tracked but not drawn until the server echoes one. A no-echo prompt never confirms an epoch, so nothing typed into it is drawn. An echo from an older epoch cannot reveal a newer one. Held predictions are scored as `withheld`, outside the hit rate, so `sudo` prompts cannot push a session toward the 85% shut-off. Timeouts now also fire from the frame poll, not only on output. |
+| **Several backspaces flickered**: 3 typed together scored 1 hit and 2 misses. Arrival was "server cursor at or past the target", which is wrong for leftward moves. | A run of predictions is confirmed when the server cursor is **exactly** where one of them left it and every cell they touched holds the predicted glyph, applied in order. A coincidental cursor match with the wrong cells is neither a confirm nor a miss. |
+| **A whole line in one write (snippet, broadcast) skipped the epoch.** The queue (12) filled, and the Enter past the cap was never examined. The echo and the prompt arriving in one chunk then confirmed the epoch, and **7 of 9** password characters were drawn. It only appeared on the fourth live run. | Bytes left over past the cap start a new epoch if any of them is not printable. The regression test feeds the echo and the prompt as one chunk, and fails without the fix. |
+
+Also: the frontend now polls a snapshot as soon as a keystroke's write resolves,
+instead of waiting for the next animation frame (§5.4 input path). That removes
+up to one frame of delay. It is not measured here, because the harness sees the
+backend only.
+
+### The live harness: `crates/app/tests/live_ssh.rs`
+
+`cargo test -p opspilot-app --test live_ssh -- --ignored --nocapture`
+
+It runs unprivileged and self-contained:
+- real `sshd` running as the user on a free loopback port;
+- a private `ssh-agent` holding a throwaway key;
+- a TCP proxy adding 100 ms each way (§4's 200 ms RTT row, without root for `tc`).
+
+It connects through `remote::connect` with **agent auth only**, opens a session
+through `registry()`, and types into real shells. It never touches the user's
+agent, keys or `known_hosts` (`SSH_AUTH_SOCK` is explicit on every command, and
+`OPSPILOT_CONFIG_DIR` points at the temp dir).
+
+Results, three consecutive runs (OpenSSH 10.6, 200 ms RTT):
+
+| | visible P50 | visible P99 | server echo P50 | hit rate |
+|---|---|---|---|---|
+| bash `--norc` | 53–83 µs | 202–203 ms | 203 ms | **100%** (73/73) |
+| zsh `-f` | 53–116 µs | 202–203 ms | 203 ms | **100%** (19/19) |
+| the user's own zsh (syntax highlighting + autosuggestions) | 65–101 µs | 204–205 ms | 204 ms | **100%** (57/57) |
+| password prompt (`read -s`) | — | — | — | **0 of 9** characters ever drawn |
+
+- Connect plus agent auth through the proxy: 1.04 s (about 5 round trips).
+- **"Visible" is the backend half** (keystroke → glyph in the snapshot). The
+  webview adds one IPC round trip and a canvas paint, which this harness cannot
+  see. §4's "< 8 ms" row is therefore met by the backend with a wide margin and
+  is still **unproven end to end**.
+- **P99 is one round trip by design.** The first key of each line is held until
+  the server echoes it; every key after it is instant. §1's "20–40×" holds for
+  typing within a line. For the first key of each line, no terminal can do
+  better than the server's echo without risking a drawn password.
+
+### Verified
+
+- `cargo test --workspace`: **299 passed**, 0 failed.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- core-term: 12 new predictor tests (7 for epochs, 4 for exact-position
+  arrival, 1 for the queue cap). The 400-case convergence proptest still passes.
+- core-ssh: agent auth against a **real `ssh-agent` process**, covering an empty
+  agent, a loaded agent, the status listing and no agent.
+- app: method order with and without the agent; `use_agent` TOML round trip;
+  held predictions are not in the snapshot and do not move the caret.
+
+### Not done
+
+- End-to-end keystroke → pixel timing (needs the webview; see 1.1).
+- `Kind::CursorOnly` still has no emitter beyond Left/Right.
+- A hardware-key agent (touch to sign) was not tested. The 90 s auth timeout
+  is sized for it.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1608,7 +1698,7 @@ Ordered by what it costs to not have.
 | 1.3 | **Benchmarks need re-measuring.** `parse_and_grid` gave 20.5 / 10.0 / 15.1 / 18.2 MiB/s across four runs of *identical code* — up to 2× variance. | §4, §14 | The machine is not quiet. The earlier 47 MiB/s figure and the later 10–18 range cannot be reconciled from here, and neither is reported as fact. `parse_only` was stable throughout. |
 | 1.4 | **No PGO or BOLT.** | §14.4 | Needs CI, which does not exist. |
 | 1.5 | **No `vttest`/`esctest` corpus.** The 86 parser tests are hand-written. | §16 | The real conformance vectors are a download that was never authorised. |
-| 1.6 | **Predictive echo is not in the live path.** `Predictor` exists, is tested, and reconciles — against synthetic output only. | §1, §5.5 | It needs to sit between keystroke and PTY write. Its value starts at real RTT, so on a local PTY it would predict nothing useful. §1's 20–40× claim remains **unmeasured**. |
+| 1.6 | **Predictive echo: end-to-end pixel timing.** Wired and measured live over 200 ms RTT (Phase 18): backend P50 ~80 µs, 100% hit rate, no password characters drawn. The webview's IPC + paint share of §4's < 8 ms is not measured. | §1, §5.5 | Needs the renderer work in 1.1 or a webview-side probe. |
 | 1.7 | **Scrollback reflow.** Resize reflows the viewport; history is not re-wrapped. | §5.6 | Needs the lazy 1,000-row chunking §5.6 describes. |
 
 ### 2. Security — known residual gaps
@@ -1618,7 +1708,7 @@ Ordered by what it costs to not have.
 | 2.1 | **Secrets broker is not a separate process.** | §12.3 | D-23. Mitigated, not solved: no command returns a secret, so a webview XSS cannot exfiltrate one — but it can still list names, overwrite them, and connect as the user, and nothing contains a compromise of the native side. |
 | 2.2 | **No `mlock`/`VirtualLock`.** Memory is zeroized but not page-locked. | §12.3 | A derived key can reach the page file. Needs platform bindings `core-store` does not have. |
 | 2.3 | **No OS-keychain convenience wrap.** | §12.3 | D-22. Deliberate. The master password is typed every unlock (15-min idle timeout). Adding the wrap later is additive; an unopenable vault has no recovery, so this is the safe direction to be incomplete in. |
-| 2.4 | **No SSH agent auth, no keyboard-interactive/MFA.** | — | Not started. Agent auth in particular is what most people actually use. |
+| 2.4 | **No keyboard-interactive/MFA.** Agent auth is done (Phase 18). | — | Not started. |
 | 2.5 | **No jump hosts.** `Host::jump_host` is in the model and always `None`. | — | Nothing reads it. |
 
 ### 3. Features with no surface yet
@@ -1632,7 +1722,7 @@ Ordered by what it costs to not have.
 | 3.4 | **LinkStrip** — the 2px per-tab RTT sparkline. **Blocked, not merely undone:** russh exposes no way to time a round trip, and drawing it from the connect time would be decoration pretending to be telemetry. | §0.4 |
 | 3.5 | **Cipher/kex readout** shows `n/a`. russh 0.62's `kex_done` takes a `negotiation::Names` that is private, so the override does not compile. | §0.5 |
 | 3.6 | **`rkyv` index cache.** Config is reparsed every launch. Irrelevant at current host counts; §12.4 is about 10,000. | §12.4 |
-| 3.7 | **Hot reload.** Editing `production.toml` in Vim should make hosts appear. §12.2 calls this "a real differentiator and it costs almost nothing" — it needs a `notify` watcher. | §12.2 |
+| 3.7 | ~~Hot reload~~ — built (`core-store/src/watch.rs`, polled by generation counter); this row was stale. | §12.2 |
 | 3.8 | **Mouse reporting** (`?1000`/`?1002`/`?1006`). Selection and clipboard are done (Phase 14). Without reporting, clicks in htop/mc/vim `mouse=a` select text instead of reaching the program. | — |
 | 3.9 | **Selection is viewport-anchored.** It clears on scroll or resize rather than following the text into scrollback, and soft-wrapped lines copy as separate lines. | — |
 | 3.10 | **No IME input.** Composition is ignored correctly, but committed CJK text has no path to the PTY: the terminal is a canvas, not an input element. | — |

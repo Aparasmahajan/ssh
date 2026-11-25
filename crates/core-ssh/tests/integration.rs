@@ -918,3 +918,101 @@ async fn a_stalled_remote_refuses_input_and_still_closes() {
     assert!(shell.write(b"x".to_vec()).is_err(), "a closed shell accepted input");
 }
 
+/// Agent auth against a real `ssh-agent` process. Skipped, loudly, where
+/// OpenSSH's client tools are not installed.
+///
+/// Every command gets `SSH_AUTH_SOCK` explicitly and the agent is checked to be
+/// up before any key is added. Inheriting the variable would add the test's key
+/// to the developer's own agent when the private one failed to start.
+#[tokio::test]
+async fn agent_auth_uses_a_real_ssh_agent() {
+    use std::process::{Command, Stdio};
+    let have = |b: &str| {
+        Command::new("sh")
+            .args(["-c", &format!("command -v {b}")])
+            .stdout(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !(have("ssh-agent") && have("ssh-add") && have("ssh-keygen")) {
+        eprintln!("SKIPPED: ssh-agent/ssh-add/ssh-keygen not installed");
+        return;
+    }
+
+    // Unix socket paths are capped near 108 bytes: keep this one short.
+    let dir = std::env::temp_dir().join(format!("opa-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("s");
+    let mut agent = Command::new("ssh-agent")
+        .args(["-D", "-a"])
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(std::time::Instant::now() < deadline, "test ssh-agent did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // The process-wide variable is what `AgentClient::connect_env` reads. No
+    // other test in this binary reads it.
+    std::env::set_var("SSH_AUTH_SOCK", &sock);
+
+    let addr = start(1, dir.clone()).await;
+    let attempt = || {
+        connect(
+            addr,
+            dir.join("known_hosts"),
+            HostKeyPolicy::AcceptNew,
+            vec![AuthMethod::Agent],
+        )
+    };
+
+    // 1. An empty agent: a clear reason, not a generic auth failure.
+    let e = expect_err(attempt().await, "an empty agent must not authenticate");
+    assert!(e.to_string().contains("holds no keys"), "{e}");
+
+    // 2. With a key: connects, and opens a working shell.
+    let key = dir.join("k");
+    let gen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(gen.success());
+    let add = Command::new("ssh-add")
+        .arg("-q")
+        .arg(&key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .status()
+        .unwrap();
+    assert!(add.success(), "ssh-add into the test agent failed");
+
+    let status = opspilot_core_ssh::agent::status().await;
+    assert!(status.available && status.keys.len() == 1, "{status:?}");
+    assert!(status.keys[0].starts_with("ssh-ed25519 SHA256:"), "{status:?}");
+
+    let t = attempt().await.expect("agent auth");
+    let mut shell = t.open_shell(24, 80).await.unwrap();
+    let mut out = shell.take_output().unwrap();
+    let banner = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&banner).contains("READY"));
+    t.disconnect().await;
+
+    // 3. No agent at all.
+    std::env::set_var("SSH_AUTH_SOCK", dir.join("nope"));
+    let e = expect_err(attempt().await, "a missing agent must not authenticate");
+    assert!(e.to_string().contains("no SSH agent"), "{e}");
+    assert!(!opspilot_core_ssh::agent::status().await.available);
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

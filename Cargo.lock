@@ -3949,6 +3949,7 @@ dependencies = [
  "opspilot-core-ssh",
  "opspilot-core-store",
  "opspilot-core-term",
+ "opspilot-test-sshd",
  "portable-pty",
  "serde",
  "serde_json",
@@ -4048,6 +4049,13 @@ dependencies = [
  "opspilot-app",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "opspilot-test-sshd"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

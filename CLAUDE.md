@@ -788,3 +788,23 @@ forever. The fix is to record the session and hang it up yourself (see
 carrying a marker": a marker in the environment is inherited by daemons that
 deliberately left the session, and killing those is a behaviour no terminal
 has.
+
+### 18.21 Prediction needs epochs, and a harness with real latency
+
+§5.5's echo-off rule ("detect via the absence of echo on prior input") cannot
+protect a password by itself. Absence is noticed only when something else
+arrives, and a password prompt sends nothing, so every character stayed drawn
+until Enter. The working rule is Mosh's: after anything that could change how
+the server treats input (Enter, an unpredicted key, a paste, a mismatch, output
+that moved the cursor unprompted), hold predictions undrawn until the server
+echoes one. See `Predictor` in `core-term/src/predict.rs`.
+
+Two more lessons from the same work:
+
+- **"Reached" must be exact for leftward edits.** Backspace and Left put the
+  server cursor *past* a target it has not reached yet.
+- **Unit tests passed with all three bugs present.** They were found by
+  `crates/app/tests/live_ssh.rs` (real sshd, real shells, a delay proxy), and
+  the last one only on its fourth run. Run it after any predictor change, more
+  than once. When writing a regression test from a live failure, reproduce the
+  **chunking** too: the queue-cap bug needs the echo and the prompt in one read.

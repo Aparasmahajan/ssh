@@ -62,6 +62,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         k8s_logs,
         list_shells,
         ssh_connect,
+        ssh_agent_status,
         ssh_disconnect,
         ssh_connections,
         ssh_open_shell,
@@ -385,6 +386,13 @@ async fn ssh_connect(request: remote::ConnectRequest) -> Result<remote::Connecti
         remote::connect(request)
     })
     .await
+}
+
+/// Whether an SSH agent is reachable and which public keys it holds. Public
+/// keys and comments only; an agent never hands out anything else.
+#[tauri::command]
+async fn ssh_agent_status() -> Result<remote::AgentInfo, String> {
+    blocking(|| Ok(remote::agent_status())).await
 }
 
 #[tauri::command]

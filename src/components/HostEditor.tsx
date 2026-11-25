@@ -182,7 +182,7 @@ export function HostEditor({
                   className="num border-hairline border-bezel-500 bg-chassis-900 px-2 py-1
                              text-micro text-text-hi focus:border-amber-500 focus:outline-none"
                 >
-                  <option value="">— password at connect time —</option>
+                  <option value="">— none: agent, then password —</option>
                   {keys.map((k) => (
                     <option key={k.path} value={k.path}>
                       {k.name} · {k.algorithm}
@@ -191,6 +191,15 @@ export function HostEditor({
                     </option>
                   ))}
                 </select>
+                <L>agent</L>
+                <label className="flex items-center gap-2 text-small text-text-mid">
+                  <input
+                    type="checkbox"
+                    checked={idn.use_agent ?? true}
+                    onChange={(e) => patchIdentity(i, { use_agent: e.target.checked })}
+                  />
+                  offer the SSH agent&apos;s keys (after the key above, before a password)
+                </label>
                 <L>password</L>
                 <SecretPicker
                   value={idn.password_ref ?? null}

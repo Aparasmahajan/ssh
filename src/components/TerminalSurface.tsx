@@ -151,6 +151,15 @@ export function TerminalSurface({
 
   const sessionId = useRef<number | null>(null);
   const generation = useRef(0);
+  /**
+   * Fetch a snapshot now rather than at the next animation frame. §5.4's input
+   * path: a keystroke renders on the input event, not up to 16 ms later. With
+   * predictive echo (§5.5) the predicted character is already in the snapshot
+   * by the time the write resolves, so this is what makes it appear instantly.
+   */
+  const pollNow = useRef<() => void>(() => {});
+  /** Latest text for every row, so a resize or DPI change can repaint without
+   *  asking Rust to resend content it already sent. */
   const lines = useRef<Map<number, LineUpdate>>(new Map());
   const cursor = useRef({ row: 0, col: 0 });
   /** Where the amber block was last drawn, so it can be erased. Without this the
@@ -476,18 +485,28 @@ export function TerminalSurface({
   useEffect(() => {
     let raf = 0;
     let inFlight = false;
+    // A poll was asked for while one was in flight: run it as soon as that one
+    // lands, or the keystroke waits for the next frame after all.
+    let again = false;
 
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
+    const poll = () => {
       const id = sessionId.current;
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
-      if (id === null || !ctx || inFlight) return;
+      if (id === null || !ctx) return;
+      if (inFlight) {
+        again = true;
+        return;
+      }
 
       inFlight = true;
       snapshotSession(id, generation.current)
         .then((snap) => {
           inFlight = false;
+          if (again) {
+            again = false;
+            queueMicrotask(poll);
+          }
           // The pane switched sessions (shell picker) while this was in
           // flight: the snapshot belongs to the old one.
           if (id !== sessionId.current) return;
@@ -522,12 +541,22 @@ export function TerminalSurface({
         })
         .catch((e: unknown) => {
           inFlight = false;
+          again = false;
           setError(String(e));
         });
     };
 
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      poll();
+    };
+
+    pollNow.current = poll;
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      pollNow.current = () => {};
+      cancelAnimationFrame(raf);
+    };
   }, [clearSelection, paintCursor, paintRow, repaintAll]);
 
   /* ---- Resize ------------------------------------------------------------ */
@@ -669,7 +698,11 @@ export function TerminalSurface({
     if (!bytes) return;
     claim();
     clearSelection();
-    for (const target of targets()) quiet(writeSession(target, bytes));
+    for (const target of targets()) {
+      // Repaint as soon as the write lands: the prediction is in the next
+      // snapshot (§5.4 input path).
+      quiet(writeSession(target, bytes).then(() => pollNow.current()));
+    }
   }, [clearSelection, paste, selectedText, targets]);
 
   /* ---- Mouse: select, copy to PRIMARY, middle-click paste ---------------- */
