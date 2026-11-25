@@ -3989,6 +3989,7 @@ name = "opspilot-core-kube"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "http",
  "k8s-openapi",
  "kube",
  "serde",

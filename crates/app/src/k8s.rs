@@ -94,6 +94,32 @@ async fn client(context: &str) -> Result<kube::Client, String> {
     Ok(c)
 }
 
+/// A credential failure means the cached client is stale: a token was revoked,
+/// a certificate rotated, or the user re-ran `aws sso login` and kubeconfig now
+/// says something else. Forget the client, so the next call builds a new one,
+/// re-reading kubeconfig and re-running the exec auth plugin.
+fn evict_client(context: &str) {
+    if let Ok(mut st) = state().lock() {
+        st.clients.remove(context);
+    }
+}
+
+/// Pass a result through, evicting the context's client if it says the
+/// credentials were rejected.
+fn checked<T>(context: &str, r: Result<T, String>) -> Result<T, String> {
+    if let Err(e) = &r {
+        if k::is_unauthorized(e) {
+            evict_client(context);
+        }
+    }
+    r
+}
+
+/// How long a watch failing on credentials keeps its client before both are
+/// rebuilt. A floor, so a context that stays unauthorized does not run its
+/// auth plugin on every poll.
+const REAUTH_AFTER: Duration = Duration::from_secs(15);
+
 fn kind(s: &str) -> Result<Kind, String> {
     Kind::parse(s).ok_or_else(|| format!("unknown kind `{s}`"))
 }
@@ -108,6 +134,16 @@ pub async fn snapshot(context: String, kind_s: String, namespace: String, since:
         let mut st = state().lock().map_err(|_| "kube state poisoned")?;
         // Sweep idle informers. O(informers), a handful.
         st.informers.retain(|_, (_, seen)| seen.elapsed() < IDLE);
+        // kube-runtime retries a rejected watch with the same client forever.
+        // Rebuild both instead, so fixed credentials are picked up.
+        let stale = st
+            .informers
+            .get(&key)
+            .is_some_and(|(inf, _)| inf.unauthorized() && inf.age() >= REAUTH_AFTER);
+        if stale {
+            st.informers.remove(&key);
+            st.clients.remove(&context);
+        }
         st.informers.get_mut(&key).map(|(inf, seen)| {
             *seen = Instant::now();
             Arc::clone(inf)
@@ -138,7 +174,7 @@ pub async fn action(
     replicas: Option<i32>,
 ) -> Result<(), String> {
     let c = client(&context).await?;
-    on_runtime(async move {
+    let r = on_runtime(async move {
         match action.as_str() {
             "delete-pod" => k::delete_pod(c, &namespace, &name).await,
             "scale" => k::scale(c, &namespace, &name, replicas.ok_or("scale needs replicas")?).await,
@@ -146,13 +182,15 @@ pub async fn action(
             other => Err(format!("unknown kubernetes action `{other}`")),
         }
     })
-    .await
+    .await;
+    checked(&context, r)
 }
 
 pub async fn yaml(context: String, kind_s: String, namespace: String, name: String) -> Result<String, String> {
     let kind = kind(&kind_s)?;
     let c = client(&context).await?;
-    on_runtime(async move { k::yaml(c, kind, &namespace, &name).await }).await
+    let r = on_runtime(async move { k::yaml(c, kind, &namespace, &name).await }).await;
+    checked(&context, r)
 }
 
 pub async fn exec(
@@ -167,8 +205,9 @@ pub async fn exec(
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(STREAM_DEPTH);
     let (in_tx, in_rx) = tokio::sync::mpsc::channel(STREAM_DEPTH);
     let (rs_tx, rs_rx) = tokio::sync::mpsc::channel(4);
-    on_runtime(async move { k::exec(c, &namespace, &pod, container, rows, cols, out_tx, in_rx, rs_rx).await })
-        .await?;
+    let r = on_runtime(async move { k::exec(c, &namespace, &pod, container, rows, cols, out_tx, in_rx, rs_rx).await })
+        .await;
+    checked(&context, r)?;
     registry().open_stream(
         rows,
         cols,
@@ -192,7 +231,8 @@ pub async fn logs(
 ) -> Result<SessionId, String> {
     let c = client(&context).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(STREAM_DEPTH);
-    on_runtime(async move { k::logs(c, &namespace, &pod, container, 1000, out_tx).await }).await?;
+    let r = on_runtime(async move { k::logs(c, &namespace, &pod, container, 1000, out_tx).await }).await;
+    checked(&context, r)?;
     registry().open_stream(
         rows,
         cols,

@@ -1557,10 +1557,34 @@ session.
 
 ### Not fixed — known
 
-- **Kubernetes:** the exec fix was not live-tested this round, because recreating the kind cluster means re-pulling 1.45 GB. It is the same split as the Docker exec fix, which was. The client cache is not invalidated on 401.
-- **SSH (`core-ssh`):** shell channels are unbounded (§13.1 rule 7).
-- **Exec'd processes** (Docker/Kubernetes) that ignore stdin EOF (`top`, `tail -f`) may keep running in the container after the tab closes.
-- **SSH connect** has no explicit timeout beyond the OS's. It no longer freezes the UI.
+All four items are closed by Phase 17, except live-testing the Kubernetes exec.
+
+---
+
+## Phase 17 — Closing the Phase 16 leftovers
+
+### Fixed
+
+| Item | Fix |
+|---|---|
+| **SSH shell channels were unbounded** (§13.1 rule 7). A server that stopped reading let typed or pasted input queue without limit. | Bounded input (256 batches) and output (64 packets, at most 4 MiB). Input is **refused**, not queued, once the remote stops reading. Resize is a watch (latest wins, never dropped). Reader and writer are separate tasks, the same paste-deadlock fix as the Docker/K8s execs. Close stops both tasks even mid-write against a stalled server. The remote-forward queue is bounded too (a 64-connection backlog, past which connections are refused). |
+| **SSH connect had no timeout of its own.** A host that drops SYNs took ~2 min; one that accepts TCP but never speaks SSH waited forever. | `Timeouts { connect: 20 s, auth: 90 s }`. Auth is longer because it can wait on a person (a hardware-key touch). `Transport::connect_with` takes custom values. |
+| **Exec'd processes outlived their tab.** Closing a Docker or Kubernetes exec does not hang anything up, so `top` and `tail -f` kept running in the container. | The exec wrapper exports `OPSPILOT_SESSION=<token>.$$`. When the user closes the tab, one more exec runs `exec_hangup.sh`. It reads the shell's pid back from any process carrying the token and SIGHUPs that **one session**, which is what a terminal hangup does. As with a local terminal, `nohup` survives, a `setsid` daemon survives, and a scrubbed environment (`sudo`) is still caught. It never signals its own session or PID 1's. Docker skips it if the exec has already ended. |
+| **The Kubernetes client cache was never invalidated on 401.** After a token revocation, cert rotation or re-login, every call kept failing with the stale client. | Credential failures (API 401, 401 on the exec websocket upgrade, a failed exec auth plugin) produce one recognisable error. Actions, YAML, exec and logs drop the cached client on it. A watch failing on credentials gets its client and informer rebuilt, at most once per 15 s. 403 is **not** treated as a credential failure, because RBAC denials are not fixed by re-authenticating. |
+
+### Verified
+
+- `cargo test --workspace`: **284 passed**, 0 failed (was 276). New tests:
+  - `core-ssh/tests/integration.rs`: a host that accepts TCP and never speaks fails with "no SSH answer" instead of hanging. A stalled server gets input refused within bounds, and close still ends the output stream.
+  - `core-docker/tests/hangup.rs`: the hangup script against real processes on this machine, run under **both dash and busybox ash**. It hangs up the leader, a background job and an env-scrubbed job. A `setsid` daemon, another tab's session and an unrelated process survive. An unknown token signals nothing; a missing token exits 2.
+  - core-kube: 401 versus 403/404/409/500, the upgrade 401, all watcher error variants, and the wrapper/token format.
+- The first version of the script also killed `setsid` daemons, because they inherit the token. The test caught it, and the script now targets the recorded session only.
+- Clippy `-D warnings`: clean.
+
+### Not done
+
+- **Live runs.** Docker Desktop was not running and `kind`/`kubectl` are not installed, so neither the Docker nor the Kubernetes live suite ran this round. The hangup is proven against real processes but not yet inside a real container. The Phase 16 Kubernetes exec split is still not live-tested.
+- The hangup needs `sh`, `tr` and `cat` in the image. Distroless images have no shell to exec into in the first place.
 
 ---
 

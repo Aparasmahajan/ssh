@@ -24,7 +24,7 @@ use russh_sftp::protocol::{
 use tokio::net::TcpListener;
 
 use opspilot_core_ssh::hostkey::HostKeyPolicy;
-use opspilot_core_ssh::transport::{AuthMethod, Endpoint, Transport};
+use opspilot_core_ssh::transport::{AuthMethod, Endpoint, Timeouts, Transport};
 
 const USER: &str = "tester";
 const PASSWORD: &str = "correct horse battery staple";
@@ -154,6 +154,12 @@ impl ServerHandler for TestHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // A server that stops reading: blocking the handler stalls this whole
+        // connection's session loop, so the client's channel window and then
+        // the TCP buffers fill — what a hung remote process looks like.
+        if data.windows(5).any(|w| w == b"STALL") {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
         session.data(channel, data.to_vec())?;
         Ok(())
     }
@@ -824,3 +830,91 @@ async fn a_secret_stored_in_the_vault_authenticates_a_real_connection() {
         "the vault opened with the wrong password"
     );
 }
+
+/// A host that accepts TCP and never speaks SSH (a wedged sshd, a port that is
+/// not sshd) used to hold the connect forever. It must fail, and say why.
+#[tokio::test]
+async fn a_silent_host_times_out_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock); // accept, then say nothing
+        }
+    });
+    let dir = tmp("silent");
+    let started = std::time::Instant::now();
+    let r = Transport::connect_with(
+        Endpoint {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            user: USER.into(),
+            identity: "test".into(),
+        },
+        &[AuthMethod::Password(PASSWORD.into())],
+        HostKeyPolicy::AcceptNew,
+        Some(dir.join("known_hosts")),
+        Timeouts {
+            connect: std::time::Duration::from_millis(500),
+            auth: std::time::Duration::from_secs(5),
+        },
+    )
+    .await;
+    let e = expect_err(r, "a silent host must not connect");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "did not time out");
+    let msg = e.to_string();
+    assert!(msg.contains("no SSH answer"), "error should say what happened: {msg}");
+}
+
+/// §13.1 rule 7 for the shell: once the remote stops reading, input is refused
+/// rather than queued without limit — and closing still ends the session,
+/// even though the server never answers the close.
+#[tokio::test]
+async fn a_stalled_remote_refuses_input_and_still_closes() {
+    let dir = tmp("stall");
+    let addr = start(1, dir.clone()).await;
+    let t = connect(
+        addr,
+        dir.join("known_hosts"),
+        HostKeyPolicy::AcceptNew,
+        vec![AuthMethod::Password(PASSWORD.into())],
+    )
+    .await
+    .unwrap();
+    let mut shell = t.open_shell(24, 80).await.unwrap();
+    let mut out = shell.take_output().unwrap();
+    let _ = out.recv().await; // banner
+
+    shell.write(b"STALL".to_vec()).unwrap();
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut refused = None;
+    // At most 256 MiB offered. The window, socket buffers and input queue
+    // together hold a few tens of MiB, so refusal must come well before that.
+    for i in 0..4096 {
+        match shell.write(chunk.clone()) {
+            Ok(()) => {}
+            Err(e) => {
+                refused = Some((i, e.to_string()));
+                break;
+            }
+        }
+        if i % 64 == 0 {
+            // Let the writer task move what it can.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    let (n, msg) = refused.expect("input to a stalled remote was never refused");
+    assert!(msg.contains("not reading"), "unexpected error: {msg}");
+    assert!(n < 1024, "accepted {n} x 64 KiB before refusing");
+
+    shell.close();
+    // Drain anything already queued; the stream must then end.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while out.recv().await.is_some() {}
+    })
+    .await;
+    assert!(ended.is_ok(), "output did not end after close on a stalled remote");
+    assert!(shell.write(b"x".to_vec()).is_err(), "a closed shell accepted input");
+}
+

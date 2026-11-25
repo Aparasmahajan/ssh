@@ -778,3 +778,13 @@ duration; an SFTP download did, for the full transfer. Rule: a command is sync
 only if it touches in-memory state alone. Everything else is `async` and does
 its work on the blocking pool (`blocking()` in `crates/app/src/lib.rs`), where
 `block_on` is allowed. Inside an async task, `block_on` panics.
+
+### 18.20 Closing an exec hangs nothing up
+
+A local terminal's close sends SIGHUP to its session. A Docker or Kubernetes
+exec does not: the attach stream ends and `top` keeps running in the container
+forever. The fix is to record the session and hang it up yourself (see
+`core-docker/src/exec_hangup.sh`). Target the **session**, not "every process
+carrying a marker": a marker in the environment is inherited by daemons that
+deliberately left the session, and killing those is a behaviour no terminal
+has.

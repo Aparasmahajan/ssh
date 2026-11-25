@@ -23,3 +23,6 @@ serde-saphyr = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Test-only, to build an upgrade error with a status code. Already in the tree
+# through kube, so it adds nothing to the build or the binary.
+http = "1"

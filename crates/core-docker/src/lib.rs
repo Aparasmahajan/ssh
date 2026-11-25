@@ -542,6 +542,74 @@ pub async fn act(api: &Api, id: &str, action: Action) -> Result<(), String> {
 /// error says so.
 const SHELL: &str = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi";
 
+/// Sends SIGHUP to what an exec session left running once its tab closes.
+/// See the script's header; shared with core-kube so there is one copy.
+pub const EXEC_HANGUP: &str = include_str!("exec_hangup.sh");
+
+/// A fresh token naming one exec session. Unique, not secret: the worst a
+/// process that forged it could do is get itself hung up.
+pub fn session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("{:016x}", h.finish())
+}
+
+/// The exec command line: record `<token>.<own pid>` for [`EXEC_HANGUP`], then
+/// become the shell. `exec` keeps the pid, so the recorded pid is the shell's,
+/// and with a TTY it is also its session id.
+pub fn shell_command(token: &str) -> String {
+    format!("export OPSPILOT_SESSION={token}.$$; {SHELL}")
+}
+
+/// Hang up whatever the exec session `token` left behind, if it is still
+/// running. Best effort and detached: a container without `sh` has nothing
+/// this could do anyway.
+async fn hang_up(api: &Api, container: &str, exec_id: &str, token: &str) {
+    // The common case is a shell the user `exit`ed: nothing left, and no
+    // second exec to spend.
+    if let Ok(i) = api.inspect_exec(exec_id).await {
+        if i.running == Some(false) {
+            return;
+        }
+    }
+    let Ok(created) = api
+        .create_exec(
+            container,
+            ExecConfig {
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    EXEC_HANGUP.into(),
+                    "sh".into(),
+                    token.into(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+    else {
+        return;
+    };
+    let _ = api
+        .start_exec(
+            &created.id,
+            Some(StartExecOptions {
+                detach: true,
+                tty: false,
+                output_capacity: None,
+            }),
+        )
+        .await;
+}
+
 /// Start an interactive shell in a running container and pump it through the
 /// given channels until either side closes.
 ///
@@ -557,6 +625,7 @@ pub async fn exec(
     mut resize: mpsc::Receiver<(u16, u16)>,
 ) -> Result<(), String> {
     check(id)?;
+    let token = session_token();
     let created = api
         .create_exec(
             id,
@@ -572,7 +641,7 @@ pub async fn exec(
                     "TERM=xterm-256color".into(),
                     "COLORTERM=truecolor".into(),
                 ]),
-                cmd: Some(vec!["/bin/sh".into(), "-c".into(), SHELL.into()]),
+                cmd: Some(vec!["/bin/sh".into(), "-c".into(), shell_command(&token)]),
                 ..Default::default()
             },
         )
@@ -605,6 +674,7 @@ pub async fn exec(
     // echo) never drains stdin. Closing the tab could not break it either —
     // the loop never got back to notice.
     let api = api.clone();
+    let hangup = (api.clone(), id.to_string(), exec_id.clone(), token);
     let writer = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -627,23 +697,28 @@ pub async fn exec(
         let _ = stdin.shutdown().await;
     });
     tokio::spawn(async move {
-        loop {
+        let closed_by_user = loop {
             tokio::select! {
                 chunk = output.next() => match chunk {
                     Some(Ok(o)) => {
                         if out.send(o.into_bytes().to_vec()).await.is_err() {
-                            break;
+                            break true;
                         }
                     }
-                    _ => break, // the exec ended
+                    _ => break false, // the exec ended
                 },
                 // Session closed while the remote is silent.
-                _ = out.closed() => break,
+                _ = out.closed() => break true,
             }
-        }
+        };
         // Whichever way output ended, the writer has nothing left to serve —
         // and may be stuck mid-write on a stalled remote.
         writer.abort();
+        drop(output);
+        if closed_by_user {
+            let (api, container, exec_id, token) = hangup;
+            hang_up(&api, &container, &exec_id, &token).await;
+        }
     });
     Ok(())
 }

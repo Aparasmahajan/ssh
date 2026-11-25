@@ -83,7 +83,53 @@ pub async fn client(context: &str) -> Result<Client, String> {
     )
     .await
     .map_err(|e| format!("context {context}: {e}"))?;
-    Client::try_from(cfg).map_err(|e| e.to_string())
+    Client::try_from(cfg).map_err(err)
+}
+
+/* ---- Errors ------------------------------------------------------------------- */
+
+/// Every credential failure's message starts with this, so the app can tell
+/// "log in again" from "the request was wrong" without a second error type
+/// crossing the crate boundary. Check with [`is_unauthorized`].
+const UNAUTHORIZED: &str = "unauthorized (401)";
+
+/// True when the server rejected the credentials, or they could not be
+/// produced (an exec auth plugin failed). Either way the cached client is
+/// stale: a new one re-reads kubeconfig and re-runs the plugin.
+fn rejected_credentials(e: &kube::Error) -> bool {
+    match e {
+        kube::Error::Api(s) => s.code == 401,
+        kube::Error::Auth(_) => true,
+        kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(c)) => {
+            c.as_u16() == 401
+        }
+        _ => false,
+    }
+}
+
+/// The one place a `kube::Error` becomes a message.
+fn err(e: kube::Error) -> String {
+    if rejected_credentials(&e) {
+        format!("{UNAUTHORIZED}: the cluster rejected this context's credentials ({e})")
+    } else {
+        e.to_string()
+    }
+}
+
+fn watch_rejected_credentials(e: &watcher::Error) -> bool {
+    match e {
+        watcher::Error::InitialListFailed(e)
+        | watcher::Error::WatchStartFailed(e)
+        | watcher::Error::WatchFailed(e) => rejected_credentials(e),
+        watcher::Error::WatchError(s) => s.code == 401,
+        watcher::Error::NoResourceVersion => false,
+    }
+}
+
+/// Whether an error message from this crate means the credentials were
+/// rejected — the signal to drop the cached client.
+pub fn is_unauthorized(msg: &str) -> bool {
+    msg.starts_with(UNAUTHORIZED)
 }
 
 /* ---- Rows --------------------------------------------------------------------- */
@@ -376,6 +422,9 @@ struct State {
     pending: Option<HashMap<String, Row>>,
     synced: bool,
     error: Option<String>,
+    /// The last error was a credential rejection. kube-runtime's backoff would
+    /// retry with the same stale client forever; the app rebuilds it instead.
+    unauthorized: bool,
     /// "watchlist" or "list+watch" — shown in the UI and the perf overlay.
     mode: &'static str,
 }
@@ -393,6 +442,7 @@ pub struct Snapshot {
 
 pub struct Informer {
     kind: Kind,
+    started: std::time::Instant,
     generation: Arc<AtomicU64>,
     state: Arc<Mutex<State>>,
     task: JoinHandle<()>,
@@ -424,10 +474,22 @@ impl Informer {
         };
         Informer {
             kind,
+            started: std::time::Instant::now(),
             generation,
             state,
             task,
         }
+    }
+
+    /// The watch is failing because the credentials were rejected.
+    pub fn unauthorized(&self) -> bool {
+        self.state.lock().map(|g| g.unauthorized).unwrap_or(false)
+    }
+
+    /// Time since this informer started, so a rebuild after a credential
+    /// failure can be rate-limited.
+    pub fn age(&self) -> std::time::Duration {
+        self.started.elapsed()
     }
 
     pub fn snapshot(&self, since: u64) -> Option<Snapshot> {
@@ -487,9 +549,15 @@ async fn run<K>(
                     apply(&state, ev, to_row, &mut ever_synced);
                 }
                 Err(e) => {
-                    let msg = e.to_string();
+                    let unauthorized = watch_rejected_credentials(&e);
+                    let msg = if unauthorized {
+                        format!("{UNAUTHORIZED}: the cluster rejected this context's credentials ({e})")
+                    } else {
+                        e.to_string()
+                    };
                     if let Ok(mut g) = state.lock() {
-                        g.error = Some(msg.clone());
+                        g.error = Some(msg);
+                        g.unauthorized = unauthorized;
                     }
                     generation.fetch_add(1, Ordering::Release);
                     // WatchList unsupported (old server, or feature gate off):
@@ -530,12 +598,14 @@ fn apply<K: Resource>(state: &Mutex<State>, ev: Event<K>, to_row: fn(&K) -> Row,
             }
             g.synced = true;
             g.error = None;
+            g.unauthorized = false;
             *ever_synced = true;
         }
         Event::Apply(o) => {
             let r = to_row(&o);
             g.rows.insert(r.uid.clone(), r);
             g.error = None;
+            g.unauthorized = false;
         }
         Event::Delete(o) => {
             let uid = o.meta().uid.clone().unwrap_or_default();
@@ -571,7 +641,7 @@ pub async fn delete_pod(client: Client, ns: &str, name: &str) -> Result<(), Stri
         .delete(name, &DeleteParams::default())
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(err)
 }
 
 pub async fn scale(client: Client, ns: &str, name: &str, replicas: i32) -> Result<(), String> {
@@ -585,7 +655,7 @@ pub async fn scale(client: Client, ns: &str, name: &str, replicas: i32) -> Resul
         .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(err)
 }
 
 /// `kubectl rollout restart`: bump an annotation on the pod template, which
@@ -606,7 +676,7 @@ pub async fn rollout_restart(client: Client, ns: &str, name: &str) -> Result<(),
         .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(err)
 }
 
 fn rfc3339(secs: u64) -> String {
@@ -651,7 +721,7 @@ pub async fn yaml(client: Client, kind: Kind, ns: &str, name: &str) -> Result<St
 }
 
 fn to_value<K: Serialize>(r: Result<K, kube::Error>) -> Result<serde_json::Value, String> {
-    let k = r.map_err(|e| e.to_string())?;
+    let k = r.map_err(err)?;
     serde_json::to_value(k).map_err(|e| e.to_string())
 }
 
@@ -679,7 +749,7 @@ pub async fn logs(
             },
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err)?;
     tokio::spawn(async move {
         let mut stream = Box::pin(stream);
         let mut buf = vec![0u8; 32 * 1024];
@@ -708,8 +778,57 @@ pub async fn logs(
 }
 
 /// Prefer bash, fall back to sh; set TERM first (exec has no env field).
-const SHELL: &str = "export TERM=xterm-256color COLORTERM=truecolor; \
-                     if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi";
+/// `OPSPILOT_SESSION=<token>.<own pid>` is what [`EXEC_HANGUP`] finds the
+/// session by; `exec` keeps the pid, so it is the shell's.
+fn shell_command(token: &str) -> String {
+    format!(
+        "export TERM=xterm-256color COLORTERM=truecolor OPSPILOT_SESSION={token}.$$; \
+         if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+    )
+}
+
+/// The same script core-docker runs, for the same reason: a closed exec does
+/// not hang up what it started. Kubernetes `exec` has the same gap
+/// (kubernetes/kubernetes#50080). One copy, in core-docker.
+const EXEC_HANGUP: &str = include_str!("../../core-docker/src/exec_hangup.sh");
+
+/// See `opspilot_core_docker::session_token`; duplicated rather than adding a
+/// dependency between two engine crates for six lines.
+fn session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("{:016x}", h.finish())
+}
+
+/// Hang up what the exec session `token` left running. Best effort, bounded:
+/// a pod that is gone or has no `sh` has nothing this could do anyway.
+async fn hang_up(api: Api<Pod>, pod: String, container: Option<String>, token: String) {
+    let mut ap = AttachParams::default().stderr(false);
+    if let Some(c) = container {
+        ap = ap.container(c);
+    }
+    let run = async {
+        let cmd = vec!["sh", "-c", EXEC_HANGUP, "sh", token.as_str()];
+        if let Ok(mut p) = api.exec(&pod, cmd, &ap).await {
+            // Read the one-line count so the stream is not left unread, then
+            // wait for the exit status.
+            if let Some(mut o) = p.stdout() {
+                let mut sink = Vec::new();
+                let _ = o.read_to_end(&mut sink).await;
+            }
+            let _ = p.join().await;
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), run).await;
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn exec(
@@ -734,8 +853,10 @@ pub async fn exec(
     ap.max_stdin_buf_size = Some(64 * 1024);
     ap.max_stdout_buf_size = Some(64 * 1024);
     let api = Api::<Pod>::namespaced(client, ns);
+    let token = session_token();
+    let hangup = (api.clone(), pod.to_string(), ap.container.clone(), token.clone());
     let mut proc = api
-        .exec(pod, vec!["/bin/sh", "-c", SHELL], &ap)
+        .exec(pod, vec!["/bin/sh".to_string(), "-c".to_string(), shell_command(&token)], &ap)
         .await
         .map_err(|e| e.to_string())?;
     let mut stdout = proc.stdout().ok_or("exec: no stdout")?;
@@ -771,22 +892,27 @@ pub async fn exec(
     });
     tokio::spawn(async move {
         let mut buf = vec![0u8; 32 * 1024];
-        loop {
+        let closed_by_user = loop {
             tokio::select! {
                 n = stdout.read(&mut buf) => match n {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => break false,
                     Ok(n) => {
                         if out.send(buf[..n].to_vec()).await.is_err() {
-                            break;
+                            break true;
                         }
                     }
                 },
-                _ = out.closed() => break,
+                _ = out.closed() => break true,
             }
-        }
+        };
         writer.abort();
         // Dropping the process aborts kube's websocket loop.
+        drop(stdout);
         drop(proc);
+        if closed_by_user {
+            let (api, pod, container, token) = hangup;
+            hang_up(api, pod, container, token).await;
+        }
     });
     Ok(())
 }
@@ -836,6 +962,48 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(kube::core::Status::failure("x", "y").with_code(code).boxed())
+    }
+
+    #[test]
+    fn only_credential_failures_read_as_unauthorized() {
+        assert!(is_unauthorized(&err(api_error(401))));
+        // 403 is RBAC: the credentials are fine, the permission is missing.
+        // Rebuilding the client would not help, so it must not trigger one.
+        for code in [403, 404, 409, 500] {
+            assert!(!is_unauthorized(&err(api_error(code))), "{code}");
+        }
+        let upgrade = |c: u16| {
+            kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(
+                http::StatusCode::from_u16(c).unwrap(),
+            ))
+        };
+        assert!(is_unauthorized(&err(upgrade(401))), "exec/attach upgrade refused");
+        assert!(!is_unauthorized(&err(upgrade(403))));
+    }
+
+    #[test]
+    fn a_watch_rejected_for_credentials_is_recognised() {
+        assert!(watch_rejected_credentials(&watcher::Error::InitialListFailed(api_error(401))));
+        assert!(watch_rejected_credentials(&watcher::Error::WatchFailed(api_error(401))));
+        assert!(watch_rejected_credentials(&watcher::Error::WatchError(
+            kube::core::Status::failure("x", "Unauthorized").with_code(401).boxed()
+        )));
+        assert!(!watch_rejected_credentials(&watcher::Error::WatchFailed(api_error(410))));
+        assert!(!watch_rejected_credentials(&watcher::Error::NoResourceVersion));
+    }
+
+    #[test]
+    fn the_exec_wrapper_records_the_session_for_the_hangup() {
+        let t = session_token();
+        assert_eq!(t.len(), 16);
+        assert_ne!(t, session_token(), "tokens must not repeat");
+        let cmd = shell_command(&t);
+        assert!(cmd.contains(&format!("OPSPILOT_SESSION={t}.$$")), "{cmd}");
+        assert!(EXEC_HANGUP.contains("OPSPILOT_SESSION="), "shared script not included");
     }
 
     #[test]
