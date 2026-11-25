@@ -1334,6 +1334,236 @@ terminal modes and re-encodes input itself. A raw Unix PTY does none of that.
 
 ---
 
+## Phase 15 — Docker, Kubernetes, Databases
+
+Built on request ahead of §17's order; see D-26. Every module is live and verified
+against a real service, not a mock.
+
+### Shared pieces
+
+| Piece | Where | Notes |
+|---|---|---|
+| **Stream session backend** | `app/src/session.rs` (`StreamIo`, `spawn_stream`) | Container and pod exec/logs are ordinary terminal sessions, fed by plain tokio channels (D-27). Logs get LF→CRLF, since there is no PTY to do `onlcr`. Read-only streams drop keystrokes. Closing the tab closes the producer. |
+| **`DataTable`** | `src/components/DataTable.tsx` | Rows are pulled by index (`rowAt`), so a million-row result can stay in Rust. Virtualised, keyed rows, sticky header, resizable columns, keyboard navigation. Sort is the caller's job. |
+| Tab `source` | `lib/streams.ts`, `state/sessions.ts` | A tab can be "exec into X" or "logs of Y". Splitting that pane opens a second exec. |
+| `ModuleKit` | `src/components/ModuleKit.tsx` | Header, status dot, two-step confirm for destructive actions, filter box, generation poll hook. |
+
+### Docker — `crates/core-docker`, `app/src/docker.rs`, `DockerPanel.tsx`
+
+- **Endpoint resolved like the docker CLI:** `DOCKER_HOST`, then `DOCKER_CONTEXT`
+  or `currentContext`, then the default socket. bollard's own default only looks
+  at `/var/run/docker.sock`, which **does not exist under Docker Desktop for Linux**.
+  The development machine is that setup, so the obvious implementation would have
+  reported "Docker not running" with Docker running.
+- **Live list from the events API, never polled (§10).** A burst of events
+  (`compose up`) is coalesced into one re-list. CPU and memory come from one stats
+  stream per running container, using `docker stats` arithmetic (page cache
+  excluded). Reconnects use exponential backoff with jitter (§8.3).
+- Actions: start, stop, restart, pause/unpause, remove (two-step confirm). Exec
+  shell (bash, falling back to sh) and logs follow, both as terminal tabs.
+- Container ids are validated against Docker's name grammar before any request.
+  bollard puts the id straight into the URL path, so `../` would reach another API
+  endpoint.
+- Commands that wait on the daemon are `async`. Tauri runs sync commands on the
+  main thread, and `docker stop` waits out a 10 s grace period.
+
+### Databases — `crates/core-db`, `core-store/src/databases.rs`, `app/src/db.rs`, `DatabasesPanel.tsx`
+
+- **Postgres** (tokio-postgres): binary protocol, and a real cursor (portal inside
+  a transaction). Values are decoded by OID without chrono/uuid/decimal crates:
+  numeric, date, timestamp(tz), time, interval, uuid, json(b), inet/cidr, bytea,
+  1-D arrays, enums, domains.
+- **MySQL/MariaDB** (mysql_async, pure-Rust deflate). The stream pauses between
+  chunks under TCP backpressure. Cancel sends `KILL QUERY` over a second connection.
+- **SQLite** (rusqlite, bundled) runs on its own thread. A file is never created
+  if missing. Scripts run statement by statement; see below.
+- **Results never leave Rust.** Rows arrive in 500-row chunks into typed Arrow
+  columns. The engine parks until the UI scrolls near the end. Sort and filter
+  run in Rust over the whole result (arrow kernels, not DataFusion: D-28). Only
+  the painted window is formatted and sent. A sort or filter switches the cursor
+  to 20k-row fetches, so a bulk load over WAN costs tens of round trips, not
+  hundreds.
+- Saved profiles live in `databases.toml`. **The model has no password field**:
+  passwords are vault references or typed per connect. SQLite paths are stored as
+  `~/…` (§12.2).
+- A new query cancels the running one. The session is one connection, so `SET`
+  and temp tables persist between queries.
+- No TLS yet (D-30). The panel warns when a profile points at a non-loopback host.
+
+Bugs the tests caught:
+- **rusqlite's `prepare` silently drops everything after the first statement.**
+  "create; insert;" reported success having only created the table.
+- Counting statements first doesn't work either: preparing statement 2 fails
+  before statement 1 has created its table. Scripts now run statement by statement.
+- The first sort reported **18 400 ms**, which was mostly the cursor waiting for
+  me to scroll. Reported time now excludes parked time.
+
+### Kubernetes — `crates/core-kube`, `app/src/k8s.rs`, `KubernetesPanel.tsx`
+
+- Reads kubeconfig the way kubectl does (`$KUBECONFIG`, then `~/.kube/config`), so
+  contexts and exec auth plugins work.
+- **Informer per (context, kind, namespace)**, using the watcher's WatchList
+  bootstrap and falling back to List+Watch on the first failure. The store is
+  keyed by UID and a relist swaps in atomically. An informer nobody samples for
+  60 s is dropped, closing its watch.
+- Pods, Deployments, Services, Nodes, plus Namespaces for the picker. The STATUS
+  column follows **kubectl's rules**: `CrashLoopBackOff`, not the phase "Running".
+- Pod exec (sh, `TERM` exported, resize forwarded), logs follow with a container
+  picker, delete pod, deployment scale ± and rollout restart, YAML view without
+  `managedFields`.
+- JSON, not protobuf (D-29). TLS is rustls with the `ring` provider, per §18.7.
+
+### Verified
+
+- `cargo test --workspace`: **267 passed**, 0 failed (was 227).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `npm run typecheck`, `lint`, `build`, `test:keys`: clean.
+- **Live suites**, all passing. Run with `--ignored`; setup is in each file's header.
+  - `core-docker/tests/live.rs`: against Docker Desktop through the `desktop-linux`
+    context. It creates a labelled container, sees it through events, gets stats,
+    execs (sh fallback on alpine), follows logs, stops it, removes it, and checks
+    that an invalid id is refused.
+  - `core-db/tests/live.rs`: against Postgres 16 and MySQL 8.4 containers. It
+    checks:
+    - the cursor parks after one chunk;
+    - sort and filter in Rust;
+    - DML affected counts and server error text;
+    - a 30 s `sleep` is cancelled by the next query;
+    - 10 Postgres types decode exactly.
+  - `core-kube/tests/live.rs`: against a kind cluster (k8s 1.34). The informer ran
+    in **watchlist** mode. It covers pod to Running, logs, exec with
+    `TERM=xterm-256color`, scale to 2/2, rollout restart, YAML, and a deleted pod
+    leaving the store.
+- **Timings** (release build, 200k-row Postgres table, local container):
+
+  | | |
+  |---|---|
+  | first 500 rows | 4.3 ms |
+  | load all + sort | 366 ms |
+  | sort only | 2.1 ms |
+  | substring filter | 36 ms |
+
+- **In the real app** (nested Xephyr display, scratch config and kubeconfig):
+  - Docker: your 6 containers listed with live CPU/memory. A container started
+    from the CLI appeared without a refresh. Exec, logs, stop and remove all worked
+    from the panel.
+  - Databases: connect with a typed (unsaved) password. 200k rows stream as you
+    scroll. Sorting by amount loaded and sorted everything.
+  - Kubernetes: the list showed "watching · watchlist". Pod exec, scaling to 3/3
+    (confirmed with the cluster's own kubectl) and the YAML view all worked.
+- **Binary size: 8.6 MB → 22.9 MB** (release, fat LTO, stripped), measured with
+  `cargo build --release -p opspilot-tauri`. This is the largest cost of the phase.
+  The contributors are kube + k8s-openapi (generated API types), arrow, bundled
+  SQLite, mysql_async and bollard. A per-crate breakdown needs `cargo bloat`, which
+  is not installed here. §3 wants engine crates behind feature flags; they are not
+  yet, so a build without Kubernetes is not possible today. That is the obvious
+  first lever if size matters.
+
+### NOT done
+
+- REST/API client and log viewer modules (still placeholders).
+- Database TLS (D-30), CSV export, schema browser and autocomplete, query history.
+- Docker: images, volumes, networks, and `ssh://` endpoints.
+- Kubernetes: protobuf (D-29), other kinds (StatefulSets, Jobs, ConfigMaps,
+  Ingress…), events, port-forward, multi-container log merge.
+- The inspector labels exec and log sessions "local #N".
+
+---
+
+## Phase 16 — Leak and robustness audit
+
+Three independent reviewers read the code cold: the Rust session/Docker/Kubernetes
+layer, the database stack, and the frontend lifecycles. Each finding acted on was
+verified against the code first, and against the library source wherever the
+behaviour depended on it (bollard, kube-client, tokio-postgres, mysql_async,
+rusqlite, portable-pty, tokio). Most of the high-severity findings predate this
+session.
+
+### High severity — fixed
+
+| Finding | Fix |
+|---|---|
+| **Switching tab or module, or splitting a pane, killed the running shell** and opened a new one. The terminal component owned the session, and React unmounts components for layout reasons. | Sessions belong to **panes** (`state/terminals.ts`). A mount reattaches; only closing the pane or tab ends the session. Snapshot `since == 0` is always a full repaint. |
+| **Every SSH, exec or log pane opened two sessions and leaked one.** Shell discovery changed `shellId`, which re-ran the open. | Shells are only discovered for local panes. The open is keyed on what is opened. |
+| **An open still in flight when its pane closed leaked forever.** | The pane store closes a late open the moment it resolves. |
+| **Postgres: a SELECT committed or rolled back the user's own transaction** (`BEGIN; DELETE …;` then a check). | Probe with a savepoint. Inside a user transaction, the cursor runs in `SAVEPOINT` and the outer handle is never dropped (its Drop sends ROLLBACK). |
+| **A parked cursor held its transaction (Postgres) or metadata lock (MySQL) indefinitely**, blocking VACUUM and `ALTER TABLE`. | Parked cursors close after 60 s idle (`PARK_LIMIT`). Fetched rows stay on screen and the status says so. |
+| **Kubernetes/Docker exec deadlocked on a paste.** One loop wrote stdin and read stdout; kube's attach buffers are 1 KiB. Closing the tab did not free it. | Separate reader and writer tasks; the reader aborts the writer. kube buffers raised to 64 KiB. Live test: 1 MB paste with echo through a Docker exec. |
+| **A webview reload leaked every session**: shells, SSH channels, DB connections and their transactions, watches. | `app_reset`, awaited before first render. Verified by reloading the real app: both shells and the Postgres connection were released. |
+| **Sync commands did network, disk and KDF work on the UI thread.** An SFTP transfer froze the window for its full length; an SSH connect to a dead host for ~2 min; vault unlock for the KDF. | 35 commands moved to the blocking pool (`blocking()` in `lib.rs`). Only in-memory commands remain sync. |
+| **DB sort/filter could freeze the UI thread** (a mutex held through a 2 M-row sort; `cancel` building the view). | The view is built outside the lock from a snapshot and installed only if still current. `cancel` reads atomics. DB commands are async. |
+| **No byte limit on a result; one large chunk could abort the app** (an Arrow string offset over 2 GiB panics, and release is `panic = "abort"`). | 512 MB budget. Chunks flush at 64 MB. Cell display is truncated at 16 KB; export is not. |
+| **The PTY writer blocked the UI thread** when the program stopped reading stdin. | Writer thread behind a bounded channel; a full queue is refused with an error. Test: 8 MB into a program that reads nothing returns an error and does not hang. |
+
+### Medium and low — fixed
+
+- **Terminal sessions:**
+  - A PTY reader leaked (thread plus screen) when a detached job held the PTY slave. It now polls with a timeout. Tested with `setsid sleep`.
+  - Close SIGHUPs the foreground process group.
+  - The child is reaped without holding the lock, and never signalled once reaped, so a recycled PID can't receive it.
+  - Spawn error paths kill the child.
+- **Docker:**
+  - The watch is dropped after 60 s unsampled. It used to run one stats stream per container forever.
+  - Events are lifecycle only; healthcheck execs caused constant re-lists.
+  - Reconnect backoff resets after a successful connection.
+  - The endpoint is cached while the daemon is down.
+- **Kubernetes:**
+  - Informers are swept on a timer, not only while the panel is visible.
+  - Non-watch calls time out after 30 s; kube's default read timeout is none.
+- **Database:**
+  - Cancel could be lost (missed-wakeup race).
+  - A superseded query is never executed.
+  - A server-side cancel is sent only if something is actually executing; a parked cancel used to kill the *next* query (live-tested on both engines).
+  - MySQL: a bounded drain plus `KILL QUERY` after an early stop. An abandoned connection is closed off-runtime, because on-runtime mysql_async drains the pending result forever.
+  - SQLite: an interrupt handle (Cancel stops a running statement), `busy_timeout`, and a bounded job queue.
+  - Postgres: a connect timeout covering startup and auth, plus keepalives. Infinite intervals no longer overflow, and a hostile array header no longer triggers a 50 GB allocation.
+  - The data mutex is no longer locked once per row.
+  - A dropped Sink marks its query done.
+  - Profile file I/O is off the UI thread.
+- **Frontend:**
+  - A Kubernetes context switch kept the old cluster's rows on screen, so actions could hit the wrong cluster. Poll data now resets on source change.
+  - Confirm buttons are bound to their target; armed on A could remove B.
+  - DB connect: double-open, unmount and reconnect races; out-of-order run results.
+  - The idle DB poll re-rendered 5×/s. The k8s list re-sorted every second for the age column.
+  - Column-resize listeners leaked, and a resize toggled the sort.
+  - Split drags stuck after Alt-Tab.
+  - Unhandled rejections from keystrokes into exited sessions.
+  - Module panels stay mounted, so leaving Databases no longer drops the connection. Hidden panels pause polling, so the backend's idle sweep releases their watches.
+- Clipboard reads time out after 5 s; pastes over 32 MiB are refused.
+
+### Verified
+
+- `cargo test --workspace`: **276 passed**, 0 failed. New regression tests:
+  - writes never block;
+  - the reader exits with a detached job holding the PTY;
+  - `close_all`;
+  - lost-cancel race;
+  - idle park closes (virtual time);
+  - byte budget and chunking;
+  - dropped Sink;
+  - infinite interval and hostile array;
+  - paste cap.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- **Live:**
+  - DB suite (6). New tests: a user transaction survives a SELECT and a failed SELECT; a parked cancel spares the next query on Postgres and on MySQL.
+  - Docker suite (2), with the 1 MB paste.
+  - A benchmark test that hung forever on a missing table now has deadlines.
+- **Real app** (nested display; each result read from shell-written files and server state, not pixels):
+  - The same shell PID survived a module round-trip and a split, and the original pane kept its history.
+  - A background tab kept running.
+  - Closing a tab killed both of its shells.
+  - The DB connection survived module switches (same server backend pid).
+  - A webview reload released all shells and the Postgres connection.
+
+### Not fixed — known
+
+- **Kubernetes:** the exec fix was not live-tested this round, because recreating the kind cluster means re-pulling 1.45 GB. It is the same split as the Docker exec fix, which was. The client cache is not invalidated on 401.
+- **SSH (`core-ssh`):** shell channels are unbounded (§13.1 rule 7).
+- **Exec'd processes** (Docker/Kubernetes) that ignore stdin EOF (`top`, `tail -f`) may keep running in the container after the tab closes.
+- **SSH connect** has no explicit timeout beyond the OS's. It no longer freezes the UI.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1371,8 +1601,9 @@ Ordered by what it costs to not have.
 
 | # | Item | Spec |
 |---|---|---|
-| 3.1 | **Module surfaces: Docker, Kubernetes, Databases, REST, Log viewer.** The module rail routes to placeholders. | Steps 12–13 |
-| 3.2 | **`DataTable`** — the shared virtualised table those modules are built on. | Step 12 |
+| 3.1 | **Module surfaces: REST client, Log viewer.** Docker, Kubernetes and Databases are built (Phase 15). | Steps 12–13 |
+| 3.2 | **Database TLS** (D-30), CSV export, schema browser/autocomplete. Connections are plaintext; the panel warns for remote hosts. | §11 |
+| 3.11 | **Kubernetes protobuf** (D-29) and further kinds, events, port-forward. | §10 |
 | 3.3 | **Transfer queue.** AIMD pipelining and the tar-pipe path. Directory transfers are **disabled, not silently broken**; single-file transfer works. | §6.1, §6.2 |
 | 3.4 | **LinkStrip** — the 2px per-tab RTT sparkline. **Blocked, not merely undone:** russh exposes no way to time a round trip, and drawing it from the connect time would be decoration pretending to be telemetry. | §0.4 |
 | 3.5 | **Cipher/kex readout** shows `n/a`. russh 0.62's `kex_done` takes a `negotiation::Names` that is private, so the override does not compile. | §0.5 |

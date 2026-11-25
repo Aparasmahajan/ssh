@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { keyToBytes, type KeyModes } from "@/lib/keys";
 import { CHORD, isAppChord } from "@/lib/platform";
 import {
-  closeSession,
   copyText,
   listShells,
   openSession,
@@ -16,7 +15,9 @@ import {
   type ShellInfo,
 } from "@/lib/session";
 import { sshOpenShell, type ConnectionInfo } from "@/lib/remote";
-import { registerPane, sessionsFor, unregisterPane } from "@/lib/broadcast";
+import { isReadOnly, openStream, streamTitle, type StreamSource } from "@/lib/streams";
+import { sessionsFor } from "@/lib/broadcast";
+import { acquire, keyOf, release } from "@/state/terminals";
 import { leaves, usePanes } from "@/state/panes";
 import { useSettings } from "@/state/settings";
 
@@ -46,6 +47,10 @@ import { useSettings } from "@/state/settings";
  */
 
 const PADDING = 6;
+
+/** Fire-and-forget IPC. A keystroke into an exited session, or a resize racing
+ *  a close, fails harmlessly; it must not raise an unhandled rejection per key. */
+const quiet = (p: Promise<unknown>) => void p.catch(() => undefined);
 
 type Cell = { w: number; h: number };
 
@@ -110,6 +115,7 @@ function fontFor(family: string, px: number, bold: boolean, italic: boolean): st
 export function TerminalSurface({
   active,
   connection,
+  source = null,
   onConnect,
   onDisconnect,
   paneId,
@@ -119,6 +125,8 @@ export function TerminalSurface({
   active: boolean;
   /** When set, the session is a shell on this host instead of a local one. */
   connection?: ConnectionInfo | null;
+  /** When set, the session is a container/pod exec or a log follow. */
+  source?: StreamSource | null;
   onConnect?: () => void;
   onDisconnect?: () => void;
   /** Identifies this pane in a split layout; absent when unsplit. */
@@ -143,8 +151,6 @@ export function TerminalSurface({
 
   const sessionId = useRef<number | null>(null);
   const generation = useRef(0);
-  /** Latest text for every row, so a resize or DPI change can repaint without
-   *  asking Rust to resend content it already sent. */
   const lines = useRef<Map<number, LineUpdate>>(new Map());
   const cursor = useRef({ row: 0, col: 0 });
   /** Where the amber block was last drawn, so it can be erased. Without this the
@@ -163,7 +169,29 @@ export function TerminalSurface({
   const [error, setError] = useState<string | null>(null);
   const [exited, setExited] = useState(false);
   const [shells, setShells] = useState<ShellInfo[]>([]);
-  const [shellId, setShellId] = useState<string | null>(null);
+  // A pane that is remounting (tab switch, split) restores the shell it was
+  // running rather than falling back to the default and reopening.
+  const [shellId, setShellId] = useState<string | null>(() => {
+    const k = paneId ? keyOf(paneId) : null;
+    return k?.startsWith("local:") ? k.slice(6) : null;
+  });
+  /** Panes without an id (none today) own their session for the component's
+   *  lifetime; panes with one hand it to state/terminals.ts. */
+  const soloPane = useRef(`solo-${Math.random().toString(36).slice(2)}`);
+  const pane = paneId ?? soloPane.current;
+  const isLocal = !source && !connection;
+  // What this pane is attached to. Only a change here opens a new session.
+  const sessionKey = source
+    ? `stream:${JSON.stringify(source)}`
+    : connection
+      ? `ssh:${connection.key}`
+      : shellId
+        ? `local:${shellId}`
+        : null;
+  // The open callback reads the latest props through a ref, so the effect
+  // depends on `sessionKey` alone and not on object identities.
+  const target = useRef({ source, connection, shellId });
+  target.current = { source, connection, shellId };
   const [scrolled, setScrolled] = useState(0);
 
   // §0.8: "Terminal font size... are user settings."
@@ -354,6 +382,10 @@ export function TerminalSurface({
 
   /* ---- Discover shells once; picking one opens the session --------------- */
   useEffect(() => {
+    // Remote and stream panes have no shell picker. Discovering shells there
+    // used to set `shellId`, re-run the open effect, and open a SECOND SSH
+    // channel / container exec while the first was still in flight.
+    if (!isLocal) return;
     let cancelled = false;
     listShells()
       .then((list) => {
@@ -367,7 +399,7 @@ export function TerminalSurface({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isLocal]);
 
   useEffect(() => {
     let cancelled = false;
@@ -393,37 +425,51 @@ export function TerminalSurface({
       // accepts a key is broken on arrival.
       wrapRef.current?.focus();
 
+      if (!sessionKey) return; // local pane still waiting for the shell list
+
       try {
+        const id = await acquire(pane, sessionKey, () => {
+          const t = target.current;
+          if (t.source) {
+            // Exec or log follow: the Rust side owns the stream; to this
+            // component it is a session id like any other.
+            return openStream(t.source, rows, cols);
+          }
+          if (t.connection) {
+            // A remote shell is a channel on the pooled transport (§8.1), not
+            // a new handshake.
+            return sshOpenShell(t.connection.key, rows, cols);
+          }
+          return openSession(rows, cols, t.shellId ?? undefined);
+        });
+        // Unmounted while waiting: the session belongs to the pane and stays
+        // open; the next mount attaches to it.
+        if (cancelled) return;
+        sessionId.current = id;
         generation.current = 0;
         lines.current.clear();
-        if (connection) {
-          // A remote shell is a channel on the pooled transport (§8.1), not a
-          // new handshake — and to everything above this line it is just a
-          // session id like any other.
-          sessionId.current = await sshOpenShell(connection.key, rows, cols);
-        } else {
-          // Only open once a shell has been chosen. Discovery lives in its own
-          // effect; doing it here meant this effect set `shellId`, which is one
-          // of its own dependencies, so it re-ran and opened a SECOND session.
-          if (!shellId) return;
-          sessionId.current = await openSession(rows, cols, shellId);
-        }
-        if (paneId && sessionId.current !== null) {
-          registerPane(paneId, sessionId.current);
-        }
+        setExited(false);
+        setError(null);
+        // Re-fit now that the session exists: the box may have changed during
+        // the open, and an attach to an existing session needs the PTY told
+        // our size. A resize also makes the next snapshot a full repaint,
+        // which is exactly what a freshly mounted canvas needs.
+        const now = fitToBox();
+        gridRef.current = now;
+        resizeSession(id, now.rows, now.cols).catch(() => undefined);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled && String(e) !== "Error: pane closed") setError(String(e));
       }
     })();
 
     return () => {
       cancelled = true;
-      const id = sessionId.current;
+      // NOT closed: unmounting is not the user ending the session (tab switch,
+      // module switch, split). Panes without an id own theirs, though.
       sessionId.current = null;
-      if (paneId) unregisterPane(paneId);
-      if (id !== null) void closeSession(id);
+      if (!paneId) release(pane);
     };
-  }, [fitToBox, measure, shellId, connection, paneId]);
+  }, [fitToBox, measure, sessionKey, pane, paneId]);
 
   /* ---- Poll: one snapshot per frame, never one message per write --------- */
 
@@ -442,6 +488,9 @@ export function TerminalSurface({
       snapshotSession(id, generation.current)
         .then((snap) => {
           inFlight = false;
+          // The pane switched sessions (shell picker) while this was in
+          // flight: the snapshot belongs to the old one.
+          if (id !== sessionId.current) return;
           if (!snap) return; // nothing changed — the common case
           generation.current = snap.generation;
           cursor.current = { row: snap.cursor_row, col: snap.cursor_col };
@@ -519,7 +568,7 @@ export function TerminalSurface({
       const id = sessionId.current;
       if (id !== null && (rows !== gridRef.current.rows || cols !== gridRef.current.cols)) {
         gridRef.current = { rows, cols };
-        void resizeSession(id, rows, cols);
+        quiet(resizeSession(id, rows, cols));
       }
       repaintAll(ctx);
     });
@@ -543,7 +592,7 @@ export function TerminalSurface({
       gridRef.current = { rows, cols };
       // The shell must be told, or it keeps wrapping at the old width and the
       // output no longer matches the pane.
-      void resizeSession(id, rows, cols);
+      quiet(resizeSession(id, rows, cols));
     }
     repaintAll(ctx);
   }, [fontPx, lineHeight, fitToBox, measure, repaintAll, clearSelection]);
@@ -557,7 +606,7 @@ export function TerminalSurface({
     // deltaY > 0 is "toward the user" = forward in time = out of history.
     const lines = e.deltaMode === 1 ? e.deltaY : e.deltaY / 40;
     const delta = Math.round(-lines * 3);
-    if (delta !== 0) void scrollSession(id, delta);
+    if (delta !== 0) quiet(scrollSession(id, delta));
   }, []);
 
   /** Where keystrokes and pastes go: this pane, or every pane in the tab while
@@ -611,7 +660,7 @@ export function TerminalSurface({
     // action. Shift+PageUp/Down is the convention every terminal uses.
     if (e.shiftKey && !e.ctrlKey && (e.key === "PageUp" || e.key === "PageDown")) {
       const page = Math.max(1, gridRef.current.rows - 1);
-      void scrollSession(id, e.key === "PageUp" ? page : -page);
+      quiet(scrollSession(id, e.key === "PageUp" ? page : -page));
       claim();
       return;
     }
@@ -620,7 +669,7 @@ export function TerminalSurface({
     if (!bytes) return;
     claim();
     clearSelection();
-    for (const target of targets()) void writeSession(target, bytes);
+    for (const target of targets()) quiet(writeSession(target, bytes));
   }, [clearSelection, paste, selectedText, targets]);
 
   /* ---- Mouse: select, copy to PRIMARY, middle-click paste ---------------- */
@@ -699,7 +748,15 @@ export function TerminalSurface({
       className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-chassis-900"
     >
       <div className="flex h-tabstrip shrink-0 items-center gap-2 border-b-hairline border-bezel-500 bg-chassis-800 px-2">
-        {connection ? (
+        {source ? (
+          <>
+            <span aria-hidden className="h-[6px] w-[6px] rounded-full bg-amber-500" />
+            <span className="num text-micro text-text-hi">{streamTitle(source)}</span>
+            {isReadOnly(source) && (
+              <span className="font-condensed uppercase text-eyebrow text-text-lo">read-only · follow</span>
+            )}
+          </>
+        ) : connection ? (
           <>
             {/* Cyan is link state, and a live SSH session is exactly that (§0.2). */}
             <span aria-hidden className="h-[6px] w-[6px] rounded-full bg-cyan-400" />
@@ -778,7 +835,7 @@ export function TerminalSurface({
             type="button"
             onClick={() => {
               const id = sessionId.current;
-              if (id !== null) void scrollSession(id, -1_000_000);
+              if (id !== null) quiet(scrollSession(id, -1_000_000));
             }}
             className="num rounded border-hairline border-amber-500 bg-amber-900 px-[5px]
                        text-micro text-amber-500"

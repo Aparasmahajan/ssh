@@ -1,0 +1,23 @@
+[package]
+name = "opspilot-core-docker"
+description = "Docker Engine client: endpoint resolution, live container state, exec and logs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# §16 dependency note: bollard is the Docker Engine API over hyper 1, which
+# the binary already links via russh/tauri, so the marginal cost is the API
+# models (~1.5 MB of release binary). Nothing initialises until the Docker
+# module is first opened (§14.5) — no socket is touched at startup.
+bollard = { version = "0.21", default-features = false, features = ["pipe", "http"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+# Docker names context directories by the SHA-256 of the context name.
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

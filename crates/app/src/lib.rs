@@ -4,7 +4,10 @@
 //! that owns `tauri.conf.json` and registers these.
 
 pub mod clipboard;
+pub mod db;
+pub mod docker;
 pub mod forwards;
+pub mod k8s;
 pub mod localfs;
 pub mod remote;
 pub mod session;
@@ -28,6 +31,7 @@ use session::{registry, SessionId, Snapshot};
 pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder.invoke_handler(tauri::generate_handler![
         app_version,
+        app_reset,
         session_open,
         session_write,
         session_snapshot,
@@ -37,6 +41,25 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         session_paste,
         session_paste_text,
         clipboard_write,
+        docker_snapshot,
+        docker_action,
+        docker_exec,
+        docker_logs,
+        db_profiles,
+        db_profile_save,
+        db_profile_delete,
+        db_open,
+        db_close,
+        db_run,
+        db_cancel,
+        db_window,
+        db_set_view,
+        k8s_contexts,
+        k8s_snapshot,
+        k8s_action,
+        k8s_yaml,
+        k8s_exec,
+        k8s_logs,
         list_shells,
         ssh_connect,
         ssh_disconnect,
@@ -80,6 +103,34 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
     ])
 }
 
+/// Run blocking work — disk, the vault's Argon2 KDF, or network calls that
+/// `block_on` the network runtime — on Tauri's blocking pool.
+///
+/// Tauri runs NON-async commands on the main (GTK) thread. Before this, an
+/// SFTP download froze the whole window for the length of the transfer, an SSH
+/// connect to a blackholed host froze it for the OS connect timeout (~2 min on
+/// Linux), and unlocking the vault froze it for the KDF. `block_on` is allowed
+/// on a blocking-pool thread, where it would panic inside an async task.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("task failed: {e}"))?
+}
+
+/// Release everything a previous page load left behind: terminal sessions,
+/// database connections, the Docker watch, Kubernetes informers. The frontend
+/// calls this once when it starts. Its state lives in memory only, so after a
+/// webview reload every one of these is unreachable — and without this, each
+/// reload leaked a full set. Returns how many terminal sessions were closed.
+#[tauri::command]
+async fn app_reset() -> Result<usize, String> {
+    let n = blocking(|| Ok(registry().close_all())).await?;
+    db::close_all().await?;
+    docker::stop();
+    k8s::stop();
+    Ok(n)
+}
+
 /// Build identity, so the frontend can prove it is running inside the desktop
 /// shell rather than a browser dev server.
 #[tauri::command]
@@ -91,14 +142,22 @@ fn app_version() -> &'static str {
 /// MSYS2, WSL, or the POSIX shells on a Unix host. Discovered by probing, so
 /// nothing is offered that would fail to launch.
 #[tauri::command]
-fn list_shells() -> Vec<shells::ShellInfo> {
-    shells::available()
+async fn list_shells() -> Result<Vec<shells::ShellInfo>, String> {
+    blocking(move || {
+        Ok({
+        shells::available()
+        })
+    })
+    .await
 }
 
 /// Spawn a shell on a PTY. `shell` is a `ShellInfo::id`; omit for the default.
 #[tauri::command]
-fn session_open(rows: u16, cols: u16, shell: Option<String>) -> Result<SessionId, String> {
-    registry().open(rows.max(1), cols.max(1), shell.as_deref())
+async fn session_open(rows: u16, cols: u16, shell: Option<String>) -> Result<SessionId, String> {
+    blocking(move || {
+        registry().open(rows.max(1), cols.max(1), shell.as_deref())
+    })
+    .await
 }
 
 /// Keyboard bytes to the PTY.
@@ -130,8 +189,11 @@ fn session_scroll(id: SessionId, delta: i64) -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn session_close(id: SessionId) -> Result<(), String> {
-    registry().close(id)
+async fn session_close(id: SessionId) -> Result<(), String> {
+    blocking(move || {
+        registry().close(id)
+    })
+    .await
 }
 
 /// Paste the system clipboard (or PRIMARY) into these sessions.
@@ -169,17 +231,168 @@ async fn clipboard_write(
     clipboard::write(&app, selection, text).await
 }
 
+/* ---- Docker ----------------------------------------------------------------- */
+
+/// Live container list, `None` when unchanged since `since` (§13.1 rule 8).
+#[tauri::command]
+fn docker_snapshot(since: u64) -> Result<Option<docker::DockerView>, String> {
+    docker::snapshot(since)
+}
+
+/// start | stop | restart | pause | unpause | remove | remove-force
+#[tauri::command]
+async fn docker_action(id: String, action: String) -> Result<(), String> {
+    docker::action(id, action).await
+}
+
+/// A shell inside a running container, as a terminal session id.
+#[tauri::command]
+async fn docker_exec(id: String, rows: u16, cols: u16) -> Result<SessionId, String> {
+    docker::exec(id, rows.max(1), cols.max(1)).await
+}
+
+/// A container's log, followed, as a read-only terminal session id.
+#[tauri::command]
+fn docker_logs(id: String, rows: u16, cols: u16) -> Result<SessionId, String> {
+    docker::logs(&id, rows.max(1), cols.max(1))
+}
+
+/* ---- Databases -------------------------------------------------------------- */
+
+#[tauri::command]
+async fn db_profiles() -> Result<Vec<opspilot_core_store::databases::DbProfile>, String> {
+    db::profiles().await
+}
+
+#[tauri::command]
+async fn db_profile_save(
+    profile: opspilot_core_store::databases::DbProfile,
+) -> Result<Vec<opspilot_core_store::databases::DbProfile>, String> {
+    db::save_profile(profile).await
+}
+
+#[tauri::command]
+async fn db_profile_delete(id: String) -> Result<Vec<opspilot_core_store::databases::DbProfile>, String> {
+    db::delete_profile(id).await
+}
+
+/// Connect with a saved profile. `password` is used only when the profile has
+/// no vault reference, and only for this connect.
+#[tauri::command]
+async fn db_open(profile: String, password: Option<String>) -> Result<db::Opened, String> {
+    db::open(profile, password).await
+}
+
+#[tauri::command]
+async fn db_close(session: u32) -> Result<(), String> {
+    db::close(session).await
+}
+
+#[tauri::command]
+async fn db_run(session: u32, sql: String) -> Result<u64, String> {
+    db::run(session, sql).await
+}
+
+#[tauri::command]
+async fn db_cancel(session: u32) -> Result<(), String> {
+    db::cancel(session).await
+}
+
+#[tauri::command]
+async fn db_window(session: u32, offset: usize, limit: usize) -> Result<Option<db::WindowView>, String> {
+    db::window(session, offset, limit).await
+}
+
+/// `sort_column` + `descending`, and a case-insensitive substring filter.
+#[tauri::command]
+async fn db_set_view(
+    session: u32,
+    sort_column: Option<usize>,
+    descending: bool,
+    filter: String,
+) -> Result<(), String> {
+    db::set_view(session, sort_column.map(|c| (c, descending)), filter).await
+}
+
+/* ---- Kubernetes -------------------------------------------------------------- */
+
+#[tauri::command]
+async fn k8s_contexts() -> Result<opspilot_core_kube::Contexts, String> {
+    blocking(move || {
+        k8s::contexts()
+    })
+    .await
+}
+
+/// Informer-backed list; `None` when unchanged since `since` (§10, §13.1).
+#[tauri::command]
+async fn k8s_snapshot(
+    context: String,
+    kind: String,
+    namespace: String,
+    since: u64,
+) -> Result<Option<opspilot_core_kube::Snapshot>, String> {
+    k8s::snapshot(context, kind, namespace, since).await
+}
+
+/// delete-pod | scale | rollout-restart
+#[tauri::command]
+async fn k8s_action(
+    context: String,
+    action: String,
+    namespace: String,
+    name: String,
+    replicas: Option<i32>,
+) -> Result<(), String> {
+    k8s::action(context, action, namespace, name, replicas).await
+}
+
+#[tauri::command]
+async fn k8s_yaml(context: String, kind: String, namespace: String, name: String) -> Result<String, String> {
+    k8s::yaml(context, kind, namespace, name).await
+}
+
+#[tauri::command]
+async fn k8s_exec(
+    context: String,
+    namespace: String,
+    pod: String,
+    container: Option<String>,
+    rows: u16,
+    cols: u16,
+) -> Result<SessionId, String> {
+    k8s::exec(context, namespace, pod, container, rows.max(1), cols.max(1)).await
+}
+
+#[tauri::command]
+async fn k8s_logs(
+    context: String,
+    namespace: String,
+    pod: String,
+    container: Option<String>,
+    rows: u16,
+    cols: u16,
+) -> Result<SessionId, String> {
+    k8s::logs(context, namespace, pod, container, rows.max(1), cols.max(1)).await
+}
+
 /* ---- Remote: SSH and SFTP ------------------------------------------------- */
 
 /// Connect, or reuse the existing transport for this exact identity (§8.1).
 #[tauri::command]
-fn ssh_connect(request: remote::ConnectRequest) -> Result<remote::ConnectionInfo, String> {
-    remote::connect(request)
+async fn ssh_connect(request: remote::ConnectRequest) -> Result<remote::ConnectionInfo, String> {
+    blocking(move || {
+        remote::connect(request)
+    })
+    .await
 }
 
 #[tauri::command]
-fn ssh_disconnect(key: String) -> Result<(), String> {
-    remote::disconnect(&key)
+async fn ssh_disconnect(key: String) -> Result<(), String> {
+    blocking(move || {
+        remote::disconnect(&key)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -189,44 +402,68 @@ fn ssh_connections() -> Vec<remote::ConnectionInfo> {
 
 /// A remote shell, as a session indistinguishable from a local one to the UI.
 #[tauri::command]
-fn ssh_open_shell(key: String, rows: u16, cols: u16) -> Result<SessionId, String> {
-    let transport = remote::get(&key)?;
-    registry().open_ssh(rows, cols, transport)
+async fn ssh_open_shell(key: String, rows: u16, cols: u16) -> Result<SessionId, String> {
+    blocking(move || {
+        let transport = remote::get(&key)?;
+        registry().open_ssh(rows, cols, transport)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_home(key: String) -> Result<String, String> {
-    remote::sftp_home(&key)
+async fn sftp_home(key: String) -> Result<String, String> {
+    blocking(move || {
+        remote::sftp_home(&key)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_list(key: String, path: String) -> Result<remote::Listing, String> {
-    remote::sftp_list(&key, &path)
+async fn sftp_list(key: String, path: String) -> Result<remote::Listing, String> {
+    blocking(move || {
+        remote::sftp_list(&key, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_read(key: String, path: String) -> Result<Vec<u8>, String> {
-    remote::sftp_read(&key, &path)
+async fn sftp_read(key: String, path: String) -> Result<Vec<u8>, String> {
+    blocking(move || {
+        remote::sftp_read(&key, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_write(key: String, path: String, data: Vec<u8>) -> Result<(), String> {
-    remote::sftp_write(&key, &path, data)
+async fn sftp_write(key: String, path: String, data: Vec<u8>) -> Result<(), String> {
+    blocking(move || {
+        remote::sftp_write(&key, &path, data)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_mkdir(key: String, path: String) -> Result<(), String> {
-    remote::sftp_mkdir(&key, &path)
+async fn sftp_mkdir(key: String, path: String) -> Result<(), String> {
+    blocking(move || {
+        remote::sftp_mkdir(&key, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_rename(key: String, from: String, to: String) -> Result<(), String> {
-    remote::sftp_rename(&key, &from, &to)
+async fn sftp_rename(key: String, from: String, to: String) -> Result<(), String> {
+    blocking(move || {
+        remote::sftp_rename(&key, &from, &to)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_remove(key: String, path: String, is_dir: bool) -> Result<(), String> {
-    remote::sftp_remove(&key, &path, is_dir)
+async fn sftp_remove(key: String, path: String, is_dir: bool) -> Result<(), String> {
+    blocking(move || {
+        remote::sftp_remove(&key, &path, is_dir)
+    })
+    .await
 }
 
 /* ---- Transfers ------------------------------------------------------------ */
@@ -237,20 +474,26 @@ fn sftp_remove(key: String, path: String, is_dir: bool) -> Result<(), String> {
 /// belong to the transfer *queue*, which does not exist yet; this is the browser
 /// action, and it is honest about being one file at a time.
 #[tauri::command]
-fn sftp_download(key: String, remote: String, local: String) -> Result<u64, String> {
-    let bytes = remote::sftp_read(&key, &remote)?;
-    let n = bytes.len() as u64;
-    localfs::write(&local, &bytes)?;
-    Ok(n)
+async fn sftp_download(key: String, remote: String, local: String) -> Result<u64, String> {
+    blocking(move || {
+        let bytes = remote::sftp_read(&key, &remote)?;
+        let n = bytes.len() as u64;
+        localfs::write(&local, &bytes)?;
+        Ok(n)
+    })
+    .await
 }
 
 /// Local -> remote.
 #[tauri::command]
-fn sftp_upload(key: String, local: String, remote: String) -> Result<u64, String> {
-    let bytes = localfs::read(&local)?;
-    let n = bytes.len() as u64;
-    remote::sftp_write(&key, &remote, bytes)?;
-    Ok(n)
+async fn sftp_upload(key: String, local: String, remote: String) -> Result<u64, String> {
+    blocking(move || {
+        let bytes = localfs::read(&local)?;
+        let n = bytes.len() as u64;
+        remote::sftp_write(&key, &remote, bytes)?;
+        Ok(n)
+    })
+    .await
 }
 
 /* ---- Local filesystem ------------------------------------------------------ */
@@ -261,23 +504,35 @@ fn local_home() -> String {
 }
 
 #[tauri::command]
-fn local_list(path: String) -> Result<localfs::LocalListing, String> {
-    localfs::list(&path)
+async fn local_list(path: String) -> Result<localfs::LocalListing, String> {
+    blocking(move || {
+        localfs::list(&path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn local_mkdir(path: String) -> Result<(), String> {
-    localfs::mkdir(&path)
+async fn local_mkdir(path: String) -> Result<(), String> {
+    blocking(move || {
+        localfs::mkdir(&path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn local_remove(path: String, is_dir: bool) -> Result<(), String> {
-    localfs::remove(&path, is_dir)
+async fn local_remove(path: String, is_dir: bool) -> Result<(), String> {
+    blocking(move || {
+        localfs::remove(&path, is_dir)
+    })
+    .await
 }
 
 #[tauri::command]
-fn local_rename(from: String, to: String) -> Result<(), String> {
-    localfs::rename(&from, &to)
+async fn local_rename(from: String, to: String) -> Result<(), String> {
+    blocking(move || {
+        localfs::rename(&from, &to)
+    })
+    .await
 }
 
 /* ---- Workspace, keys, forwards --------------------------------------------- */
@@ -285,20 +540,28 @@ fn local_rename(from: String, to: String) -> Result<(), String> {
 use opspilot_core_store::{keys as keystore, model::Host as StoredHost, store, Workspace};
 
 #[tauri::command]
-fn workspace_list() -> Vec<String> {
-    let names = store::list_workspaces();
-    if names.is_empty() {
-        // First run: create one rather than showing an empty app with no way
-        // forward.
-        let _ = store::ensure_default();
-        return store::list_workspaces();
-    }
-    names
+async fn workspace_list() -> Result<Vec<String>, String> {
+    blocking(move || {
+        Ok({
+        let names = store::list_workspaces();
+        if names.is_empty() {
+            // First run: create one rather than showing an empty app with no way
+            // forward.
+            let _ = store::ensure_default();
+            return Ok(store::list_workspaces());
+        }
+        names
+        })
+    })
+    .await
 }
 
 #[tauri::command]
-fn workspace_load(name: String) -> Result<Workspace, String> {
-    store::load(&name)
+async fn workspace_load(name: String) -> Result<Workspace, String> {
+    blocking(move || {
+        store::load(&name)
+    })
+    .await
 }
 
 /// Bumps whenever a config file changes on disk (§12.2 hot reload).
@@ -312,24 +575,35 @@ fn config_generation() -> u64 {
 }
 
 #[tauri::command]
-fn host_upsert(workspace: String, host: StoredHost) -> Result<Workspace, String> {
-    store::upsert_host(&workspace, host)
+async fn host_upsert(workspace: String, host: StoredHost) -> Result<Workspace, String> {
+    blocking(move || {
+        store::upsert_host(&workspace, host)
+    })
+    .await
 }
 
 #[tauri::command]
-fn host_delete(workspace: String, host_id: String) -> Result<Workspace, String> {
-    store::delete_host(&workspace, &host_id)
+async fn host_delete(workspace: String, host_id: String) -> Result<Workspace, String> {
+    blocking(move || {
+        store::delete_host(&workspace, &host_id)
+    })
+    .await
 }
 
 /// Private keys found on this machine. Never reads private key material.
 #[tauri::command]
-fn keys_list() -> Vec<keystore::KeyInfo> {
-    keystore::discover()
+async fn keys_list() -> Result<Vec<keystore::KeyInfo>, String> {
+    blocking(move || {
+        Ok({
+        keystore::discover()
+        })
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn forward_start(
+async fn forward_start(
     connection_key: String,
     id: String,
     kind: String,
@@ -338,20 +612,26 @@ fn forward_start(
     target_host: Option<String>,
     target_port: Option<u16>,
 ) -> Result<forwards::ForwardStatus, String> {
-    forwards::start(
-        &connection_key,
-        &id,
-        &kind,
-        &bind_address,
-        bind_port,
-        target_host,
-        target_port,
-    )
+    blocking(move || {
+        forwards::start(
+            &connection_key,
+            &id,
+            &kind,
+            &bind_address,
+            bind_port,
+            target_host,
+            target_port,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn forward_stop(id: String) -> Result<(), String> {
-    forwards::stop(&id)
+async fn forward_stop(id: String) -> Result<(), String> {
+    blocking(move || {
+        forwards::stop(&id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -365,12 +645,15 @@ fn forward_list() -> Vec<forwards::ForwardStatus> {
 /// `Result`: a tunnel that cannot bind must not cost the user the session they
 /// actually asked for.
 #[tauri::command]
-fn forward_auto_start(
+async fn forward_auto_start(
     connection_key: String,
     workspace: String,
     host_id: String,
 ) -> Result<Vec<forwards::AutoStarted>, String> {
-    forwards::auto_start(&connection_key, &workspace, &host_id)
+    blocking(move || {
+        forwards::auto_start(&connection_key, &workspace, &host_id)
+    })
+    .await
 }
 
 /* ---- Status rail telemetry -------------------------------------------------- */
@@ -453,13 +736,19 @@ fn vault_status() -> vault::VaultStatus {
 }
 
 #[tauri::command]
-fn vault_create(password: String) -> Result<vault::VaultStatus, String> {
-    vault::create(password)
+async fn vault_create(password: String) -> Result<vault::VaultStatus, String> {
+    blocking(move || {
+        vault::create(password)
+    })
+    .await
 }
 
 #[tauri::command]
-fn vault_unlock(password: String) -> Result<vault::VaultStatus, String> {
-    vault::unlock(password)
+async fn vault_unlock(password: String) -> Result<vault::VaultStatus, String> {
+    blocking(move || {
+        vault::unlock(password)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -469,28 +758,43 @@ fn vault_lock() -> vault::VaultStatus {
 
 /// Record ids. Never secrets.
 #[tauri::command]
-fn vault_list() -> Result<Vec<String>, String> {
-    vault::list()
+async fn vault_list() -> Result<Vec<String>, String> {
+    blocking(move || {
+        vault::list()
+    })
+    .await
 }
 
 #[tauri::command]
-fn vault_set(id: String, secret: String) -> Result<Vec<String>, String> {
-    vault::set(id, secret)
+async fn vault_set(id: String, secret: String) -> Result<Vec<String>, String> {
+    blocking(move || {
+        vault::set(id, secret)
+    })
+    .await
 }
 
 #[tauri::command]
-fn vault_remove(id: String) -> Result<Vec<String>, String> {
-    vault::remove(id)
+async fn vault_remove(id: String) -> Result<Vec<String>, String> {
+    blocking(move || {
+        vault::remove(id)
+    })
+    .await
 }
 
 #[tauri::command]
-fn vault_change_password(password: String) -> Result<vault::VaultStatus, String> {
-    vault::change_password(password)
+async fn vault_change_password(password: String) -> Result<vault::VaultStatus, String> {
+    blocking(move || {
+        vault::change_password(password)
+    })
+    .await
 }
 
 #[tauri::command]
-fn vault_audit(limit: Option<usize>) -> Result<vault::AuditView, String> {
-    vault::audit_log(limit.unwrap_or(200))
+async fn vault_audit(limit: Option<usize>) -> Result<vault::AuditView, String> {
+    blocking(move || {
+        vault::audit_log(limit.unwrap_or(200))
+    })
+    .await
 }
 
 /// Test-only helpers for the process-global config root.

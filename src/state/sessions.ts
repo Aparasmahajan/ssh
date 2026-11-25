@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import type { ConnectionInfo } from "@/lib/remote";
+import { streamTitle, type StreamSource } from "@/lib/streams";
+import { usePanes } from "./panes";
 
 /**
  * Open sessions — the tab model.
@@ -24,6 +26,8 @@ export interface Tab {
   shellId?: string;
   /** Set when this tab is attached to an SSH connection. */
   connection?: ConnectionInfo;
+  /** Set for a container/pod exec or a log follow. */
+  source?: StreamSource;
 }
 
 interface SessionState {
@@ -32,6 +36,7 @@ interface SessionState {
 
   openLocal: (shellId: string, title: string) => string;
   openRemote: (connection: ConnectionInfo, kind: TabKind) => string;
+  openStream: (source: StreamSource) => string;
   close: (id: string) => void;
   activate: (id: string) => void;
   /** Cycle by ±1, wrapping. Drives Ctrl+Shift+[ / ]. */
@@ -69,7 +74,20 @@ export const useSessions = create<SessionState>((set, get) => ({
     return id;
   },
 
-  close: (id) =>
+  openStream: (source) => {
+    const id = nextId();
+    set((s) => ({
+      tabs: [...s.tabs, { id, kind: "shell", title: streamTitle(source), source }],
+      activeId: id,
+    }));
+    return id;
+  },
+
+  close: (id) => {
+    // Closing a tab ends its panes' sessions and drops its pane tree. Without
+    // this, the × button left the tree (and, now that sessions belong to panes,
+    // the shells) behind.
+    usePanes.getState().forget(id);
     set((s) => {
       const idx = s.tabs.findIndex((t) => t.id === id);
       const tabs = s.tabs.filter((t) => t.id !== id);
@@ -78,7 +96,8 @@ export const useSessions = create<SessionState>((set, get) => ({
       // tab should land you on the new last tab, not on nothing.
       const next = tabs[Math.min(idx, tabs.length - 1)];
       return { tabs, activeId: next?.id ?? null };
-    }),
+    });
+  },
 
   activate: (id) => set({ activeId: id }),
 

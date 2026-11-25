@@ -19,6 +19,12 @@ opspilot-core-term = { path = "../core-term" }
 # remote access is optional, and gating it would mean two build shapes to test.
 opspilot-core-ssh = { path = "../core-ssh" }
 opspilot-core-store = { path = "../core-store" }
+opspilot-core-docker = { path = "../core-docker" }
+opspilot-core-db = { path = "../core-db" }
+opspilot-core-kube = { path = "../core-kube" }
+# Only for the `kube::Client` type held in the per-context cache; the version
+# and features are set in core-kube.
+kube = { version = "5", default-features = false }
 # `sync` for the oneshot that carries a clipboard read back from the GTK main
 # thread. A feature of a crate already linked, not a new dependency.
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
@@ -36,6 +42,11 @@ portable-pty = "0.8"
 # makes the dependency nameable. Version must track Tauri's (see Cargo.lock).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+# poll() on the PTY and killpg() on close (session.rs). Already linked through
+# portable-pty and tokio: no new code in the binary.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

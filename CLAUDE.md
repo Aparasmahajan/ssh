@@ -755,3 +755,26 @@ The same lesson applies to key bindings. ⌘ maps to Ctrl only for apps whose
 window is not a terminal. Ctrl+W, Ctrl+K, Ctrl+B and Ctrl+I (which *is* Tab) all
 belong to the shell, so off macOS app chords are Ctrl+Shift (D-24). Before binding
 anything, check what the key sends to a shell.
+
+### 18.18 A session belongs to its pane, not to the component drawing it
+
+The terminal component opened its session on mount and closed it on unmount.
+React unmounts for layout reasons: only the active tab is mounted, module panels
+replace the surface, and a split moves the original leaf one level deeper, which
+remounts it. Every tab switch, module switch and split therefore killed the
+running shell and started a new one. Own long-lived backend resources in a store
+keyed by the domain object (pane, tab, connection). Components attach and
+detach; only closing the object ends the resource. The same rule held for the DB
+panel's connection.
+
+Also: an `await` inside an effect must check for cancellation and dispose of
+what it opened. Otherwise every unmount that races an open leaks it.
+
+### 18.19 Tauri runs synchronous commands on the UI thread
+
+A `#[tauri::command] fn` (not `async fn`) runs on the main GTK thread. Any disk,
+network, KDF or `block_on` call in one freezes the whole window for its
+duration; an SFTP download did, for the full transfer. Rule: a command is sync
+only if it touches in-memory state alone. Everything else is `async` and does
+its work on the blocking pool (`blocking()` in `crates/app/src/lib.rs`), where
+`block_on` is allowed. Inside an async task, `block_on` panics.

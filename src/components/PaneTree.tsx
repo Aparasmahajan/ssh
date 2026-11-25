@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { usePanes, type Node } from "@/state/panes";
 import { IS_APPLE, hasMod } from "@/lib/platform";
 import type { ConnectionInfo } from "@/lib/remote";
+import type { StreamSource } from "@/lib/streams";
 import { TerminalSurface } from "./TerminalSurface";
 
 /**
@@ -17,11 +18,13 @@ import { TerminalSurface } from "./TerminalSurface";
 export function PaneTree({
   tabId,
   connection,
+  source = null,
   onConnect,
   onCloseTab,
 }: {
   tabId: string;
   connection: ConnectionInfo | null;
+  source?: StreamSource | null;
   onConnect: () => void;
   onCloseTab: () => void;
 }) {
@@ -110,6 +113,7 @@ export function PaneTree({
         focused={focused ?? ""}
         broadcast={broadcast}
         connection={connection}
+        source={source}
         onConnect={onConnect}
         onFocus={(id) => focus(tabId, id)}
         onClose={(id) => close(tabId, id)}
@@ -124,6 +128,7 @@ function Branch({
   focused,
   broadcast,
   connection,
+  source,
   onConnect,
   onFocus,
   onClose,
@@ -133,6 +138,7 @@ function Branch({
   focused: string;
   broadcast: boolean;
   connection: ConnectionInfo | null;
+  source: StreamSource | null;
   onConnect: () => void;
   onFocus: (id: string) => void;
   onClose: (id: string) => void;
@@ -177,6 +183,7 @@ function Branch({
           tabId={tabId}
           broadcast={broadcast}
           connection={connection}
+          source={source}
           onConnect={onConnect}
           onDisconnect={() => onClose(node.id)}
         />
@@ -201,6 +208,7 @@ function Branch({
           focused={focused}
           broadcast={broadcast}
           connection={connection}
+          source={source}
           onConnect={onConnect}
           onFocus={onFocus}
           onClose={onClose}
@@ -216,6 +224,14 @@ function Branch({
           dragging.current = true;
           e.currentTarget.setPointerCapture(e.pointerId);
         }}
+        // Alt-Tab mid-drag loses capture without a pointerup; without these
+        // the split kept resizing on plain hover afterwards.
+        onLostPointerCapture={() => {
+          dragging.current = false;
+        }}
+        onPointerCancel={() => {
+          dragging.current = false;
+        }}
         className={`relative shrink-0 bg-chassis-900 ${
           vertical ? "w-[4px] cursor-col-resize" : "h-[4px] cursor-row-resize"
         } hover:bg-bezel-500`}
@@ -228,6 +244,7 @@ function Branch({
           focused={focused}
           broadcast={broadcast}
           connection={connection}
+          source={source}
           onConnect={onConnect}
           onFocus={onFocus}
           onClose={onClose}
