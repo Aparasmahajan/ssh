@@ -43,9 +43,20 @@ pub enum Selection {
 
 /// Paste `text` into each session. Every target gets its own encoding, since
 /// one pane may be in bracketed-paste mode and its neighbour not.
+/// Largest paste accepted. A clipboard holding a 500 MB log dump is almost
+/// certainly an accident, and every byte of it would be "typed" into a shell.
+pub const PASTE_MAX: usize = 32 * 1024 * 1024;
+
 pub fn paste_into(ids: &[SessionId], text: &str) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
+    }
+    if text.len() > PASTE_MAX {
+        return Err(format!(
+            "paste refused: {} MB is over the {} MB limit",
+            text.len() / (1024 * 1024),
+            PASTE_MAX / (1024 * 1024)
+        ));
     }
     let mut first_err = None;
     for &id in ids {
@@ -87,7 +98,12 @@ mod native {
             });
         })
         .map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "clipboard request dropped".to_string())
+        // GTK always answers (with NULL after its own selection timeout), but
+        // only if its main loop is running. Never wait on it forever.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(r) => r.map_err(|_| "clipboard request dropped".to_string()),
+            Err(_) => Err("clipboard did not answer within 5 s".into()),
+        }
     }
 }
 
@@ -123,6 +139,12 @@ mod tests {
     fn pasting_nothing_into_nothing_is_not_an_error() {
         assert!(paste_into(&[], "x").is_ok());
         assert!(paste_into(&[u32::MAX], "").is_ok());
+    }
+
+    #[test]
+    fn an_oversized_paste_is_refused_before_touching_any_session() {
+        let big = "x".repeat(PASTE_MAX + 1);
+        assert!(paste_into(&[u32::MAX], &big).unwrap_err().contains("refused"));
     }
 
     #[test]

@@ -475,3 +475,62 @@ native clipboard on those platforms too, and nothing above `clipboard.rs` change
 Bracketed paste is decided in Rust, because only the Rust side knows the
 application's current `?2004` state. Any `ESC[201~` inside the pasted text is
 stripped, so clipboard content cannot close the bracket early and type the rest.
+
+---
+
+### D-26 — Docker, Kubernetes and Databases built before §17's step-1 budgets are green
+
+§17: "Do not start step 6 until step 1's budgets are green in CI." Step 1 is not
+green. The terminal still draws on a 2D canvas (D-19) and there is no CI. The user
+asked for these modules anyway, so they were built. The rule exists so the terminal
+spine is fast first, and nothing here makes the terminal slower; the modules attach
+to the spine through the session registry. The wgpu renderer is still Pending 1.1.
+
+---
+
+### D-27 — container and pod exec/logs are terminal sessions, not CLI wrappers
+
+A "stream" session backend (`session.rs`, `StreamIo`) takes plain tokio channels:
+bytes out; bytes and resizes in; drop to close. Docker exec/logs (bollard) and
+Kubernetes exec/logs (kube-rs) all feed it, so they render in the ordinary
+terminal with its scrollback, selection, paste and coalescing, as §10 asks. Neither
+the `docker` CLI nor `kubectl` is needed. kubectl was not even installed on the
+development machine. The core crates share no types with `app`: the channel
+contract is the whole interface.
+
+---
+
+### D-28 — Arrow, but not DataFusion
+
+§11 names DataFusion for client-side filter/sort/aggregate. The grid needs
+single-column sort and a substring filter, and arrow's own kernels do both
+(`sort_to_indices` over a primitive array; a byte-level scan). DataFusion would add
+tens of MB of binary for a SQL engine the grid does not use. Measured on 200k rows
+(release, live Postgres): sort 2.1 ms, filter 36 ms. The §4 row ("1 M rows sort
+< 150 ms") has ~10× headroom without it. Revisit if client-side aggregation or
+multi-column sort is wanted.
+
+---
+
+### D-29 — Kubernetes over JSON, not protobuf
+
+§10's "single biggest kube-client win and it is a header" assumes a client that
+can decode protobuf. kube-rs cannot; it is JSON-only. The other §10 decisions are
+in place:
+- watch, don't poll (informers);
+- WatchList bootstrap, feature-detected with a List+Watch fallback;
+- a UID-keyed store that dedups churn;
+- keyed reconciliation in the table.
+
+The protobuf gap is a decode-cost multiple on the initial list of a very large
+cluster. It is not a polling-vs-watching difference.
+
+---
+
+### D-30 — database connections are plaintext TCP (no TLS yet)
+
+tokio-postgres is used with `NoTls` and mysql_async without a TLS feature. A server
+that requires TLS refuses the connection with a clear error rather than silently
+downgrading. Use an SSH port forward (Transfers module) to reach production
+databases until TLS lands. Adding it means rustls with the `ring` provider (§18.7),
+which is already linked through kube and russh.

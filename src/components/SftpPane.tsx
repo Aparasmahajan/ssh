@@ -147,7 +147,12 @@ export function SftpPane({
               onKeyDown={(ev) => {
                 if (ev.key === "Enter") open(e);
               }}
-              className="row-hoverable grid cursor-default grid-cols-[1fr_84px_128px_150px]
+              // The name keeps at least 120px. With a bare `1fr` it collapsed to
+              // nothing whenever the pane was narrower than the fixed columns
+              // (~400px, i.e. with the tree and inspector open): the one column
+              // that identifies the row vanished first. Narrow panes now scroll
+              // sideways instead.
+              className="row-hoverable grid cursor-default grid-cols-[minmax(120px,1fr)_84px_128px_150px]
                          items-center gap-2 px-2 py-[1px] text-small"
             >
               <span className="truncate text-text-hi">

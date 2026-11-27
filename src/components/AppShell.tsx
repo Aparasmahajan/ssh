@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { TREE_MAX, TREE_MIN, useLayout } from "@/state/layout";
+import { TREE_MAX, TREE_MIN, useLayout, type ModuleId } from "@/state/layout";
+
+/** Modules whose panel keeps state worth keeping (a DB connection and its
+ *  result, a selected row) — kept mounted after first use. */
+const KEEP_MOUNTED: readonly ModuleId[] = ["docker", "databases", "kubernetes"];
 import { useSessions } from "@/state/sessions";
 import { CHORD, isAppChord } from "@/lib/platform";
 import { isFontZoomKey, useSettings } from "@/state/settings";
@@ -33,6 +37,9 @@ import { HostEditor } from "./HostEditor";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { VaultPanel } from "./VaultPanel";
 import { Landing } from "./Landing";
+import { DockerPanel } from "./DockerPanel";
+import { DatabasesPanel } from "./DatabasesPanel";
+import { KubernetesPanel } from "./KubernetesPanel";
 import { PaneTree } from "./PaneTree";
 import { usePanes } from "@/state/panes";
 
@@ -49,6 +56,13 @@ export function AppShell({ fallbackHosts }: { fallbackHosts: readonly Host[] }) 
   const { tabs, activeId, openLocal, openRemote } = useSessions();
 
   const [workspace, setWorkspace] = useState<string>("");
+  // Module panels opened at least once; see KEEP_MOUNTED.
+  const [visited, setVisited] = useState<ModuleId[]>([]);
+  useEffect(() => {
+    if ((KEEP_MOUNTED as readonly string[]).includes(activeModule) && !visited.includes(activeModule)) {
+      setVisited((v) => [...v, activeModule]);
+    }
+  }, [activeModule, visited]);
   const [stored, setStored] = useState<StoredHost[]>([]);
   const [editing, setEditing] = useState<StoredHost | null>(null);
   const [connecting, setConnecting] = useState<{ prefill?: StoredHost; sftp?: boolean } | null>(
@@ -213,6 +227,7 @@ export function AppShell({ fallbackHosts }: { fallbackHosts: readonly Host[] }) 
         key={activeTab.id}
         tabId={activeTab.id}
         connection={activeTab.connection ?? null}
+        source={activeTab.source ?? null}
         onConnect={() => setConnecting({})}
         onCloseTab={() => {
           usePanes.getState().forget(activeTab.id);
@@ -276,7 +291,21 @@ export function AppShell({ fallbackHosts }: { fallbackHosts: readonly Host[] }) 
               </button>
             </div>
           )}
-          {surface()}
+          {/* Module panels stay mounted once visited and are hidden, not
+              unmounted, when you switch away: unmounting closed the database
+              connection and threw away the query result every time you
+              glanced at a terminal. Hidden panels pause their polling. */}
+          {IS_DESKTOP &&
+            KEEP_MOUNTED.map((m) =>
+              visited.includes(m) ? (
+                <div key={m} className={activeModule === m ? "flex min-h-0 min-w-0 flex-1" : "hidden"}>
+                  {m === "docker" && <DockerPanel active={activeModule === m} />}
+                  {m === "databases" && <DatabasesPanel active={activeModule === m} />}
+                  {m === "kubernetes" && <KubernetesPanel active={activeModule === m} />}
+                </div>
+              ) : null,
+            )}
+          {!(KEEP_MOUNTED as readonly string[]).includes(activeModule) && surface()}
         </section>
 
         {!zoomed && !inspectorCollapsed &&

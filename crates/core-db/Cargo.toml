@@ -1,0 +1,22 @@
+[package]
+name = "opspilot-core-db"
+description = "Database engines: streamed results into Arrow columns, sorted and filtered in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde.workspace = true
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
+rusqlite = { version = "0.39", features = ["bundled", "column_decltype"] }
+arrow-array = "57"
+arrow-schema = "57"
+arrow-ord = "57"
+arrow-select = "57"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

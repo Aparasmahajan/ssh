@@ -48,3 +48,7 @@ opt-level = 1
 # cipher code, and an unoptimized crypto path makes SFTP unusable locally.
 [profile.dev.package."*"]
 opt-level = 3
+# No debug info for dependencies: it was most of a 69 GB target/ dir, and nobody
+# steps through tauri or wgpu in a debugger. Our own crates keep full debug info,
+# so backtraces through them are unchanged.
+debug = false

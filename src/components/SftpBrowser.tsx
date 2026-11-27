@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { SftpPane } from "./SftpPane";
+import { TransferList } from "./TransferList";
 import {
   baseName,
-  humanSize,
   localHome,
   remoteJoin,
-  sftpDownload,
   sftpHome,
-  sftpUpload,
+  transferStart,
   type ConnectionInfo,
   type FsEntry,
 } from "@/lib/remote";
@@ -28,7 +27,6 @@ export function SftpBrowser({ connection }: { connection: ConnectionInfo }) {
   const [remoteSel, setRemoteSel] = useState<{ name: string; entry: FsEntry } | null>(null);
   const [refresh, setRefresh] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     void localHome().then(setLocalPath);
@@ -43,42 +41,30 @@ export function SftpBrowser({ connection }: { connection: ConnectionInfo }) {
 
   const bump = useCallback(() => setRefresh((n) => n + 1), []);
 
+  // Queued, not awaited: the engine runs in the background and the list below
+  // shows it. Files and directories alike; the engine picks the method.
   const download = async () => {
-    if (!remoteSel || remoteSel.entry.kind === "dir") return;
-    setBusy(true);
+    if (!remoteSel || !localPath) return;
     setStatus(null);
     try {
-      const target = joinLocal(localPath, remoteSel.name);
-      const n = await sftpDownload(connection.key, remoteJoin(remotePath, remoteSel.name), target);
-      setStatus(`↓ ${remoteSel.name} — ${humanSize(n)}`);
-      bump();
+      await transferStart(connection.key, "download", remoteJoin(remotePath, remoteSel.name), localPath);
     } catch (e) {
       setStatus(String(e));
-    } finally {
-      setBusy(false);
     }
   };
 
   const upload = async () => {
-    if (!localSel || localSel.entry.kind === "dir") return;
-    setBusy(true);
+    if (!localSel || !remotePath) return;
     setStatus(null);
     try {
-      const source = joinLocal(localPath, localSel.name);
-      const n = await sftpUpload(connection.key, source, remoteJoin(remotePath, localSel.name));
-      setStatus(`↑ ${localSel.name} — ${humanSize(n)}`);
-      bump();
+      await transferStart(connection.key, "upload", joinLocal(localPath, localSel.name), remotePath);
     } catch (e) {
       setStatus(String(e));
-    } finally {
-      setBusy(false);
     }
   };
 
-  // Directory transfers need recursion and a queue; offering a button that
-  // silently does nothing for a folder would be worse than disabling it.
-  const canDownload = !!remoteSel && remoteSel.entry.kind !== "dir" && !busy;
-  const canUpload = !!localSel && localSel.entry.kind !== "dir" && !busy;
+  const canDownload = !!remoteSel && remoteSel.name !== "..";
+  const canUpload = !!localSel && localSel.name !== "..";
 
   return (
     <section
@@ -101,7 +87,7 @@ export function SftpBrowser({ connection }: { connection: ConnectionInfo }) {
             type="button"
             onClick={() => void upload()}
             disabled={!canUpload}
-            title={canUpload ? "Upload the selected local file" : "Select a local file"}
+            title={canUpload ? `Upload ${localSel?.name ?? ""}` : "Select a local file or folder"}
             className="num w-full rounded border-hairline border-bezel-500 px-1 py-1 text-micro
                        text-text-mid disabled:opacity-30
                        enabled:hover:border-amber-500 enabled:hover:bg-amber-900
@@ -113,7 +99,7 @@ export function SftpBrowser({ connection }: { connection: ConnectionInfo }) {
             type="button"
             onClick={() => void download()}
             disabled={!canDownload}
-            title={canDownload ? "Download the selected remote file" : "Select a remote file"}
+            title={canDownload ? `Download ${remoteSel?.name ?? ""}` : "Select a remote file or folder"}
             className="num w-full rounded border-hairline border-bezel-500 px-1 py-1 text-micro
                        text-text-mid disabled:opacity-30
                        enabled:hover:border-amber-500 enabled:hover:bg-amber-900
@@ -135,21 +121,15 @@ export function SftpBrowser({ connection }: { connection: ConnectionInfo }) {
         />
       </div>
 
+      <TransferList connectionKey={connection.key} onFinished={bump} />
+
       <footer className="flex h-status shrink-0 items-center gap-3 border-t-hairline border-bezel-500 bg-chassis-800 px-3">
         <span className="font-condensed uppercase text-eyebrow text-text-lo">sftp</span>
         <span className="num text-micro text-text-mid">
           {connection.user}@{connection.host}:{connection.port}
         </span>
         <span className="num text-micro text-text-lo">identity {connection.identity}</span>
-        {status && (
-          <span
-            className={`num ml-auto text-micro ${
-              status.startsWith("↑") || status.startsWith("↓") ? "text-cyan-400" : "text-red-500"
-            }`}
-          >
-            {status}
-          </span>
-        )}
+        {status && <span className="num ml-auto text-micro text-red-500">{status}</span>}
       </footer>
     </section>
   );

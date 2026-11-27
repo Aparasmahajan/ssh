@@ -29,6 +29,8 @@ interface PredictionStat {
   missed: number;
   timed_out: number;
   flushes: number;
+  /** Tentative predictions resolved without being drawn. Not in the hit rate. */
+  withheld: number;
   outstanding: number;
   disabled: boolean;
   echo_off: boolean;
@@ -169,6 +171,14 @@ function Prediction({ p }: { p: PredictionStat }) {
       ) : (
         <span className="text-text-lo" title="not enough samples to judge a hit rate yet">
           {p.samples} sample{p.samples === 1 ? "" : "s"}
+        </span>
+      )}
+      {p.withheld > 0 && (
+        <span
+          className="text-text-lo"
+          title="first keys of a line and keys at no-echo prompts: held until the server echoes, never drawn on a guess"
+        >
+          · {p.withheld} held
         </span>
       )}
       {p.outstanding > 0 && <span className="ml-auto text-text-lo">{p.outstanding} pending</span>}

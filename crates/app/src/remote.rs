@@ -58,6 +58,9 @@ pub struct AuthSpec {
     /// Same, for an encrypted private key's passphrase.
     #[serde(default)]
     pub passphrase_ref: Option<String>,
+    /// Offer the SSH agent's keys. `None` means yes, as with `ssh`.
+    #[serde(default)]
+    pub use_agent: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -115,15 +118,28 @@ impl ConnectRequest {
         }
         .filter(|s| !s.is_empty());
 
-        // Key first: it is the one that can succeed without a prompt, and trying
-        // a password against a key-only server just burns an attempt.
+        // Order: the configured key, then the agent, then the password.
+        //
+        // A configured key is the user saying which key this host takes, so it
+        // goes before the agent's whole key list: each rejected key counts
+        // against the server's MaxAuthTries (6 by default), and an agent with
+        // many keys can exhaust it before the right one is offered. The agent
+        // goes before the password because it needs no prompt, and a password
+        // tried against a key-only server just burns an attempt.
         if let Some(p) = &self.auth.key_path {
             if !p.is_empty() {
                 v.push(AuthMethod::PrivateKey {
-                    path: p.into(),
+                    // §12.2: config stores `~/.ssh/id_ed25519`, never an
+                    // absolute path. It has to be resolved here, or every saved
+                    // host with a key fails with "~/.ssh/...: No such file"
+                    // (found in the GUI test of the transfer queue).
+                    path: opspilot_core_store::paths::resolve(p).into(),
                     passphrase,
                 });
             }
+        }
+        if self.auth.use_agent.unwrap_or(true) {
+            v.push(AuthMethod::Agent);
         }
         if let Some(p) = password {
             v.push(AuthMethod::Password(p));
@@ -175,7 +191,7 @@ pub fn connect(req: ConnectRequest) -> Result<ConnectionInfo, String> {
 
     let methods = req.methods()?;
     if methods.is_empty() {
-        return Err("no authentication method supplied (password or key)".into());
+        return Err("no authentication method supplied (key, SSH agent or password)".into());
     }
     let policy = req.policy();
 
@@ -190,6 +206,25 @@ pub fn connect(req: ConnectRequest) -> Result<ConnectionInfo, String> {
         .insert(key.clone(), Arc::new(transport));
 
     Ok(info(&key, &endpoint))
+}
+
+/// What the running SSH agent holds, for the connect dialog.
+#[derive(Serialize, Clone, Debug)]
+pub struct AgentInfo {
+    pub available: bool,
+    pub keys: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Ask the agent what it holds. A local socket round trip, but on Windows the
+/// pipe connect can wait up to its timeout, so callers run it off the UI thread.
+pub fn agent_status() -> AgentInfo {
+    let s = runtime().block_on(opspilot_core_ssh::agent::status());
+    AgentInfo {
+        available: s.available,
+        keys: s.keys,
+        error: s.error,
+    }
 }
 
 fn info(key: &str, e: &Endpoint) -> ConnectionInfo {
@@ -412,12 +447,63 @@ mod tests {
                 passphrase: None,
                 password_ref: None,
                 passphrase_ref: None,
+                use_agent: None,
             },
             host_key_policy: None,
         };
         let m = req.methods().unwrap();
         assert!(matches!(m[0], AuthMethod::PrivateKey { .. }));
-        assert!(matches!(m[1], AuthMethod::Password(_)));
+        assert!(matches!(m[1], AuthMethod::Agent), "agent goes between key and password");
+        assert!(matches!(m[2], AuthMethod::Password(_)));
+        assert_eq!(m.len(), 3);
+    }
+
+    /// §12.2's portable form must reach the key loader as a real path.
+    #[test]
+    fn a_portable_key_path_is_resolved_against_home() {
+        let req = ConnectRequest {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity: "i".into(),
+            auth: AuthSpec {
+                password: None,
+                key_path: Some("~/.ssh/id_ed25519".into()),
+                passphrase: None,
+                password_ref: None,
+                passphrase_ref: None,
+                use_agent: Some(false),
+            },
+            host_key_policy: None,
+        };
+        let m = req.methods().unwrap();
+        let AuthMethod::PrivateKey { path, .. } = &m[0] else { panic!("{m:?}") };
+        assert!(!path.to_string_lossy().starts_with('~'), "not expanded: {}", path.display());
+        assert!(path.ends_with(".ssh/id_ed25519"), "{}", path.display());
+    }
+
+    #[test]
+    fn the_agent_is_offered_by_default_and_can_be_turned_off() {
+        let mut req = ConnectRequest {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity: "i".into(),
+            auth: AuthSpec {
+                password: None,
+                key_path: None,
+                passphrase: None,
+                password_ref: None,
+                passphrase_ref: None,
+                use_agent: None,
+            },
+            host_key_policy: None,
+        };
+        let m = req.methods().unwrap();
+        assert!(matches!(m.as_slice(), [AuthMethod::Agent]), "nothing configured: agent only");
+
+        req.auth.use_agent = Some(false);
+        assert!(req.methods().unwrap().is_empty());
     }
 
     #[test]
@@ -434,10 +520,15 @@ mod tests {
                 passphrase: None,
                 password_ref: None,
                 passphrase_ref: None,
+                use_agent: None,
             },
             host_key_policy: None,
         };
-        assert!(req.methods().unwrap().is_empty());
+        let m = req.methods().unwrap();
+        assert!(
+            m.iter().all(|m| matches!(m, AuthMethod::Agent)),
+            "an empty field became a key or password attempt"
+        );
     }
 
     /// A host configured to use the vault must not silently connect with
@@ -455,6 +546,7 @@ mod tests {
                 passphrase: None,
                 password_ref: Some("vault:prod/root".into()),
                 passphrase_ref: None,
+                use_agent: None,
             },
             host_key_policy: None,
         };
@@ -479,6 +571,7 @@ mod tests {
                 passphrase: None,
                 password_ref: None,
                 passphrase_ref: None,
+                use_agent: None,
             },
             host_key_policy: p.map(String::from),
         };

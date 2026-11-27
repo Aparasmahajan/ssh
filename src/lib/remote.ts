@@ -23,6 +23,16 @@ export interface AuthSpec {
    */
   passwordRef?: string;
   passphraseRef?: string;
+  /** Offer the SSH agent's keys. Defaults to true, as with `ssh`. */
+  useAgent?: boolean;
+}
+
+/** What the running SSH agent holds. Public keys only. */
+export interface AgentInfo {
+  available: boolean;
+  /** `ED25519 SHA256:… comment`, one per usable key. */
+  keys: string[];
+  error: string | null;
 }
 
 export type HostKeyPolicy = "accept-new" | "strict" | "verify-only";
@@ -82,10 +92,13 @@ export const sshConnect = (request: ConnectRequest) =>
         passphrase: request.auth.passphrase ?? null,
         password_ref: request.auth.passwordRef ?? null,
         passphrase_ref: request.auth.passphraseRef ?? null,
+        use_agent: request.auth.useAgent ?? null,
       },
       host_key_policy: request.hostKeyPolicy ?? null,
     },
   });
+
+export const sshAgentStatus = () => invoke<AgentInfo>("ssh_agent_status");
 
 export const sshDisconnect = (key: string) => invoke<void>("ssh_disconnect", { key });
 export const sshConnections = () => invoke<ConnectionInfo[]>("ssh_connections");
@@ -105,10 +118,61 @@ export const sftpRename = (key: string, from: string, to: string) =>
 export const sftpRemove = (key: string, path: string, isDir: boolean) =>
   invoke<void>("sftp_remove", { key, path, isDir });
 
-export const sftpDownload = (key: string, remote: string, local: string) =>
-  invoke<number>("sftp_download", { key, remote, local });
-export const sftpUpload = (key: string, local: string, remote: string) =>
-  invoke<number>("sftp_upload", { key, local, remote });
+/* ---- Transfers (§6) ------------------------------------------------------------ */
+
+export type TransferDirection = "upload" | "download";
+export type TransferState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/** One queued transfer, sampled at 10 Hz. Counters only; nothing is pushed. */
+export interface Transfer {
+  id: number;
+  key: string;
+  direction: TransferDirection;
+  name: string;
+  source: string;
+  target_dir: string;
+  state: TransferState;
+  error: string | null;
+  /** Failed only because the target exists: offer to replace it. */
+  exists: boolean;
+  /** "pipelined", "striped · 8 channels", "batched · tar", … (§6.2: shown). */
+  method: string;
+  /** Why the method changed, e.g. tar missing on the server. */
+  note: string | null;
+  bytes_total: number;
+  bytes_done: number;
+  files_total: number;
+  files_done: number;
+  skipped: number;
+  /** Peak request window (§6.1). */
+  window: number;
+  elapsed_ms: number;
+}
+
+/**
+ * Queue a transfer of a file or a directory. `source` is remote for a
+ * download and local for an upload; `targetDir` is where it lands, on the
+ * other side. The engine picks the method (§6.1/§6.2).
+ */
+export const transferStart = async (
+  key: string,
+  direction: TransferDirection,
+  source: string,
+  targetDir: string,
+  overwrite = false,
+) => {
+  const id = await invoke<number>("transfer_start", { key, direction, source, targetDir, overwrite });
+  // Wake the transfer list now: while idle it samples at 1 Hz, and a small
+  // job can start and finish between two samples.
+  window.dispatchEvent(new Event(TRANSFER_QUEUED));
+  return id;
+};
+
+/** Fired on `window` whenever a transfer is queued. */
+export const TRANSFER_QUEUED = "opspilot:transfer-queued";
+export const transferList = () => invoke<Transfer[]>("transfer_list");
+export const transferCancel = (id: number) => invoke<void>("transfer_cancel", { id });
+export const transferClear = () => invoke<void>("transfer_clear");
 
 /* ---- Local ----------------------------------------------------------------- */
 

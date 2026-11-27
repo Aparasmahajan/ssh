@@ -19,6 +19,8 @@ export interface StoredIdentity {
   password_ref?: string | null;
   /** Vault reference for an encrypted `key_path`'s passphrase. */
   passphrase_ref?: string | null;
+  /** Offer the SSH agent's keys. Absent means true: the file only says `false`. */
+  use_agent?: boolean;
   read_only?: boolean;
 }
 

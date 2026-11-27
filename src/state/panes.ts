@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { release } from "./terminals";
 
 /**
  * Split layout — UI_BUILD_GUIDE Step 9.
@@ -152,6 +153,8 @@ export const usePanes = create<PaneState>((set, get) => ({
   close: (tabId, paneId) => {
     const tree = get().trees[tabId];
     if (!tree) return;
+    // The pane is gone, so is its session (state/terminals.ts).
+    release(paneId);
     const next = closePane(tree, paneId);
     set((s) => {
       const trees = { ...s.trees };
@@ -191,6 +194,9 @@ export const usePanes = create<PaneState>((set, get) => ({
 
   forget: (tabId) =>
     set((s) => {
+      // Every pane of the tab ends with it.
+      const tree = s.trees[tabId];
+      if (tree) for (const id of leaves(tree)) release(id);
       const trees = { ...s.trees };
       const focused = { ...s.focused };
       const broadcast = { ...s.broadcast };

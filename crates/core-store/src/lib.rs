@@ -14,6 +14,7 @@
 //!
 //! NOT here yet: the `rkyv` index cache (§12.4). Recorded in COMPLETED.md.
 
+pub mod databases;
 pub mod keys;
 pub mod model;
 pub mod paths;

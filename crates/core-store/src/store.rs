@@ -135,6 +135,7 @@ mod tests {
                 key_path: Some("~/.ssh/id_ed25519".into()),
                 password_ref: None,
                 passphrase_ref: None,
+                use_agent: true,
                 read_only: false,
             }],
             forwards: vec![],

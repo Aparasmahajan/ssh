@@ -24,7 +24,7 @@ use russh_sftp::protocol::{
 use tokio::net::TcpListener;
 
 use opspilot_core_ssh::hostkey::HostKeyPolicy;
-use opspilot_core_ssh::transport::{AuthMethod, Endpoint, Transport};
+use opspilot_core_ssh::transport::{AuthMethod, Endpoint, Timeouts, Transport};
 
 const USER: &str = "tester";
 const PASSWORD: &str = "correct horse battery staple";
@@ -154,6 +154,12 @@ impl ServerHandler for TestHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // A server that stops reading: blocking the handler stalls this whole
+        // connection's session loop, so the client's channel window and then
+        // the TCP buffers fill — what a hung remote process looks like.
+        if data.windows(5).any(|w| w == b"STALL") {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
         session.data(channel, data.to_vec())?;
         Ok(())
     }
@@ -823,4 +829,190 @@ async fn a_secret_stored_in_the_vault_authenticates_a_real_connection() {
         Vault::open(&vault_path, "the wrong master password").is_err(),
         "the vault opened with the wrong password"
     );
+}
+
+/// A host that accepts TCP and never speaks SSH (a wedged sshd, a port that is
+/// not sshd) used to hold the connect forever. It must fail, and say why.
+#[tokio::test]
+async fn a_silent_host_times_out_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock); // accept, then say nothing
+        }
+    });
+    let dir = tmp("silent");
+    let started = std::time::Instant::now();
+    let r = Transport::connect_with(
+        Endpoint {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            user: USER.into(),
+            identity: "test".into(),
+        },
+        &[AuthMethod::Password(PASSWORD.into())],
+        HostKeyPolicy::AcceptNew,
+        Some(dir.join("known_hosts")),
+        Timeouts {
+            connect: std::time::Duration::from_millis(500),
+            auth: std::time::Duration::from_secs(5),
+        },
+    )
+    .await;
+    let e = expect_err(r, "a silent host must not connect");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "did not time out");
+    let msg = e.to_string();
+    assert!(msg.contains("no SSH answer"), "error should say what happened: {msg}");
+}
+
+/// §13.1 rule 7 for the shell: once the remote stops reading, input is refused
+/// rather than queued without limit — and closing still ends the session,
+/// even though the server never answers the close.
+#[tokio::test]
+async fn a_stalled_remote_refuses_input_and_still_closes() {
+    let dir = tmp("stall");
+    let addr = start(1, dir.clone()).await;
+    let t = connect(
+        addr,
+        dir.join("known_hosts"),
+        HostKeyPolicy::AcceptNew,
+        vec![AuthMethod::Password(PASSWORD.into())],
+    )
+    .await
+    .unwrap();
+    let mut shell = t.open_shell(24, 80).await.unwrap();
+    let mut out = shell.take_output().unwrap();
+    let _ = out.recv().await; // banner
+
+    shell.write(b"STALL".to_vec()).unwrap();
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut refused = None;
+    // At most 256 MiB offered. The window, socket buffers and input queue
+    // together hold a few tens of MiB, so refusal must come well before that.
+    for i in 0..4096 {
+        match shell.write(chunk.clone()) {
+            Ok(()) => {}
+            Err(e) => {
+                refused = Some((i, e.to_string()));
+                break;
+            }
+        }
+        if i % 64 == 0 {
+            // Let the writer task move what it can.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    let (n, msg) = refused.expect("input to a stalled remote was never refused");
+    assert!(msg.contains("not reading"), "unexpected error: {msg}");
+    assert!(n < 1024, "accepted {n} x 64 KiB before refusing");
+
+    shell.close();
+    // Drain anything already queued; the stream must then end.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while out.recv().await.is_some() {}
+    })
+    .await;
+    assert!(ended.is_ok(), "output did not end after close on a stalled remote");
+    assert!(shell.write(b"x".to_vec()).is_err(), "a closed shell accepted input");
+}
+
+/// Agent auth against a real `ssh-agent` process. Skipped, loudly, where
+/// OpenSSH's client tools are not installed.
+///
+/// Every command gets `SSH_AUTH_SOCK` explicitly and the agent is checked to be
+/// up before any key is added. Inheriting the variable would add the test's key
+/// to the developer's own agent when the private one failed to start.
+#[tokio::test]
+async fn agent_auth_uses_a_real_ssh_agent() {
+    use std::process::{Command, Stdio};
+    let have = |b: &str| {
+        Command::new("sh")
+            .args(["-c", &format!("command -v {b}")])
+            .stdout(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !(have("ssh-agent") && have("ssh-add") && have("ssh-keygen")) {
+        eprintln!("SKIPPED: ssh-agent/ssh-add/ssh-keygen not installed");
+        return;
+    }
+
+    // Unix socket paths are capped near 108 bytes: keep this one short.
+    let dir = std::env::temp_dir().join(format!("opa-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("s");
+    let mut agent = Command::new("ssh-agent")
+        .args(["-D", "-a"])
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(std::time::Instant::now() < deadline, "test ssh-agent did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // The process-wide variable is what `AgentClient::connect_env` reads. No
+    // other test in this binary reads it.
+    std::env::set_var("SSH_AUTH_SOCK", &sock);
+
+    let addr = start(1, dir.clone()).await;
+    let attempt = || {
+        connect(
+            addr,
+            dir.join("known_hosts"),
+            HostKeyPolicy::AcceptNew,
+            vec![AuthMethod::Agent],
+        )
+    };
+
+    // 1. An empty agent: a clear reason, not a generic auth failure.
+    let e = expect_err(attempt().await, "an empty agent must not authenticate");
+    assert!(e.to_string().contains("holds no keys"), "{e}");
+
+    // 2. With a key: connects, and opens a working shell.
+    let key = dir.join("k");
+    let gen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(gen.success());
+    let add = Command::new("ssh-add")
+        .arg("-q")
+        .arg(&key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .status()
+        .unwrap();
+    assert!(add.success(), "ssh-add into the test agent failed");
+
+    let status = opspilot_core_ssh::agent::status().await;
+    assert!(status.available && status.keys.len() == 1, "{status:?}");
+    assert!(status.keys[0].starts_with("ssh-ed25519 SHA256:"), "{status:?}");
+
+    let t = attempt().await.expect("agent auth");
+    let mut shell = t.open_shell(24, 80).await.unwrap();
+    let mut out = shell.take_output().unwrap();
+    let banner = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&banner).contains("READY"));
+    t.disconnect().await;
+
+    // 3. No agent at all.
+    std::env::set_var("SSH_AUTH_SOCK", dir.join("nope"));
+    let e = expect_err(attempt().await, "a missing agent must not authenticate");
+    assert!(e.to_string().contains("no SSH agent"), "{e}");
+    assert!(!opspilot_core_ssh::agent::status().await.available);
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { keyToBytes, type KeyModes } from "@/lib/keys";
 import { CHORD, isAppChord } from "@/lib/platform";
 import {
-  closeSession,
   copyText,
   listShells,
   openSession,
@@ -16,7 +15,18 @@ import {
   type ShellInfo,
 } from "@/lib/session";
 import { sshOpenShell, type ConnectionInfo } from "@/lib/remote";
-import { registerPane, sessionsFor, unregisterPane } from "@/lib/broadcast";
+import {
+  coveredByOverlay,
+  gpuAvailable,
+  gpuPaneRemove,
+  gpuPaneSet,
+  NATIVE_KEY_EVENT,
+  type PaneState,
+} from "@/lib/gpuTerm";
+import { listen } from "@tauri-apps/api/event";
+import { isReadOnly, openStream, streamTitle, type StreamSource } from "@/lib/streams";
+import { sessionsFor } from "@/lib/broadcast";
+import { acquire, keyOf, release } from "@/state/terminals";
 import { leaves, usePanes } from "@/state/panes";
 import { useSettings } from "@/state/settings";
 
@@ -43,9 +53,27 @@ import { useSettings } from "@/state/settings";
  * What it cannot do, and is the reason it is temporary: the glyphs are rasterised
  * by the browser on the UI thread, so a flood competes with React for the same
  * thread — exactly the coupling §3 exists to forbid.
+ *
+ * ## The GPU path (Linux/X11)
+ *
+ * Where `gpu_pane_set` succeeds, Rust draws this pane in a native child window
+ * over the canvas (`crates/app/src/gpu_term.rs`) and the canvas stops painting.
+ * This component still owns input, selection and layout, and reports the
+ * pane's rect, focus and selection once per frame when they change. While an
+ * overlay (`data-overlay`) covers the pane the native view hides and the
+ * canvas, kept current underneath, paints again. Cell metrics then come from
+ * Rust (whole pixels), so both paths lay out the same grid.
+ *
+ * Keys: while a GPU pane has focus, Rust types into the session itself and the
+ * page only sees app chords (`crates/app/src/keys.rs`). `onKeyDown` below is
+ * then the path for those chords, and the whole path on the canvas.
  */
 
 const PADDING = 6;
+
+/** Fire-and-forget IPC. A keystroke into an exited session, or a resize racing
+ *  a close, fails harmlessly; it must not raise an unhandled rejection per key. */
+const quiet = (p: Promise<unknown>) => void p.catch(() => undefined);
 
 type Cell = { w: number; h: number };
 
@@ -110,6 +138,7 @@ function fontFor(family: string, px: number, bold: boolean, italic: boolean): st
 export function TerminalSurface({
   active,
   connection,
+  source = null,
   onConnect,
   onDisconnect,
   paneId,
@@ -119,6 +148,8 @@ export function TerminalSurface({
   active: boolean;
   /** When set, the session is a shell on this host instead of a local one. */
   connection?: ConnectionInfo | null;
+  /** When set, the session is a container/pod exec or a log follow. */
+  source?: StreamSource | null;
   onConnect?: () => void;
   onDisconnect?: () => void;
   /** Identifies this pane in a split layout; absent when unsplit. */
@@ -143,6 +174,13 @@ export function TerminalSurface({
 
   const sessionId = useRef<number | null>(null);
   const generation = useRef(0);
+  /**
+   * Fetch a snapshot now rather than at the next animation frame. §5.4's input
+   * path: a keystroke renders on the input event, not up to 16 ms later. With
+   * predictive echo (§5.5) the predicted character is already in the snapshot
+   * by the time the write resolves, so this is what makes it appear instantly.
+   */
+  const pollNow = useRef<() => void>(() => {});
   /** Latest text for every row, so a resize or DPI change can repaint without
    *  asking Rust to resend content it already sent. */
   const lines = useRef<Map<number, LineUpdate>>(new Map());
@@ -159,11 +197,43 @@ export function TerminalSurface({
   const cursorColor = useRef<string>("");
   const bgColor = useRef<string>("");
   const gridRef = useRef({ rows: 24, cols: 80 });
+  /** GPU path state. `live`: the native view is drawing; `covered`: an
+   *  overlay hides it, so the canvas paints instead. */
+  const gpu = useRef({ live: false, covered: false, inFlight: false, again: false, sent: "" });
+  /** Send the pane state now rather than at the next frame (focus changes). */
+  const syncNow = useRef<() => void>(() => {});
+  /** Broadcast settings, read from the per-frame sync without re-running it. */
+  const bcast = useRef({ broadcast, tabId });
+  bcast.current = { broadcast, tabId };
+  /** Cell size from Rust while the GPU path is on, in CSS px. */
+  const gpuCell = useRef<Cell | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [exited, setExited] = useState(false);
   const [shells, setShells] = useState<ShellInfo[]>([]);
-  const [shellId, setShellId] = useState<string | null>(null);
+  // A pane that is remounting (tab switch, split) restores the shell it was
+  // running rather than falling back to the default and reopening.
+  const [shellId, setShellId] = useState<string | null>(() => {
+    const k = paneId ? keyOf(paneId) : null;
+    return k?.startsWith("local:") ? k.slice(6) : null;
+  });
+  /** Panes without an id (none today) own their session for the component's
+   *  lifetime; panes with one hand it to state/terminals.ts. */
+  const soloPane = useRef(`solo-${Math.random().toString(36).slice(2)}`);
+  const pane = paneId ?? soloPane.current;
+  const isLocal = !source && !connection;
+  // What this pane is attached to. Only a change here opens a new session.
+  const sessionKey = source
+    ? `stream:${JSON.stringify(source)}`
+    : connection
+      ? `ssh:${connection.key}`
+      : shellId
+        ? `local:${shellId}`
+        : null;
+  // The open callback reads the latest props through a ref, so the effect
+  // depends on `sessionKey` alone and not on object identities.
+  const target = useRef({ source, connection, shellId });
+  target.current = { source, connection, shellId };
   const [scrolled, setScrolled] = useState(0);
 
   // §0.8: "Terminal font size... are user settings."
@@ -180,6 +250,9 @@ export function TerminalSurface({
 
   /* ---- Measure the cell from the actual loaded font --------------------- */
   const measure = useCallback((ctx: CanvasRenderingContext2D): Cell => {
+    // The native renderer's cells are whole pixels; the canvas must lay out
+    // the same grid or the two disagree on the column count.
+    if (gpuCell.current) return gpuCell.current;
     ctx.font = fontFor(termFamily(), fontRef.current, false, false);
     // "M" in a monospace face is the advance width. Measuring a long run and
     // dividing avoids accumulating the sub-pixel error of a single glyph.
@@ -300,7 +373,9 @@ export function TerminalSurface({
   }, []);
 
   const clearSelection = useCallback(() => {
-    if (selection.current === null) return;
+    // Always redraw, even when already empty: the highlight layer is the
+    // source of truth only for what is drawn, and with the GPU path it can
+    // sit hidden for minutes before an overlay reveals it.
     selection.current = null;
     drawSelection();
   }, [drawSelection]);
@@ -354,6 +429,10 @@ export function TerminalSurface({
 
   /* ---- Discover shells once; picking one opens the session --------------- */
   useEffect(() => {
+    // Remote and stream panes have no shell picker. Discovering shells there
+    // used to set `shellId`, re-run the open effect, and open a SECOND SSH
+    // channel / container exec while the first was still in flight.
+    if (!isLocal) return;
     let cancelled = false;
     listShells()
       .then((list) => {
@@ -367,7 +446,7 @@ export function TerminalSurface({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isLocal]);
 
   useEffect(() => {
     let cancelled = false;
@@ -393,55 +472,82 @@ export function TerminalSurface({
       // accepts a key is broken on arrival.
       wrapRef.current?.focus();
 
+      if (!sessionKey) return; // local pane still waiting for the shell list
+
       try {
+        const id = await acquire(pane, sessionKey, () => {
+          const t = target.current;
+          if (t.source) {
+            // Exec or log follow: the Rust side owns the stream; to this
+            // component it is a session id like any other.
+            return openStream(t.source, rows, cols);
+          }
+          if (t.connection) {
+            // A remote shell is a channel on the pooled transport (§8.1), not
+            // a new handshake.
+            return sshOpenShell(t.connection.key, rows, cols);
+          }
+          return openSession(rows, cols, t.shellId ?? undefined);
+        });
+        // Unmounted while waiting: the session belongs to the pane and stays
+        // open; the next mount attaches to it.
+        if (cancelled) return;
+        sessionId.current = id;
         generation.current = 0;
         lines.current.clear();
-        if (connection) {
-          // A remote shell is a channel on the pooled transport (§8.1), not a
-          // new handshake — and to everything above this line it is just a
-          // session id like any other.
-          sessionId.current = await sshOpenShell(connection.key, rows, cols);
-        } else {
-          // Only open once a shell has been chosen. Discovery lives in its own
-          // effect; doing it here meant this effect set `shellId`, which is one
-          // of its own dependencies, so it re-ran and opened a SECOND session.
-          if (!shellId) return;
-          sessionId.current = await openSession(rows, cols, shellId);
-        }
-        if (paneId && sessionId.current !== null) {
-          registerPane(paneId, sessionId.current);
-        }
+        setExited(false);
+        setError(null);
+        // Re-fit now that the session exists: the box may have changed during
+        // the open, and an attach to an existing session needs the PTY told
+        // our size. A resize also makes the next snapshot a full repaint,
+        // which is exactly what a freshly mounted canvas needs.
+        const now = fitToBox();
+        gridRef.current = now;
+        resizeSession(id, now.rows, now.cols).catch(() => undefined);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled && String(e) !== "Error: pane closed") setError(String(e));
       }
     })();
 
     return () => {
       cancelled = true;
-      const id = sessionId.current;
+      // NOT closed: unmounting is not the user ending the session (tab switch,
+      // module switch, split). Panes without an id own theirs, though.
       sessionId.current = null;
-      if (paneId) unregisterPane(paneId);
-      if (id !== null) void closeSession(id);
+      if (!paneId) release(pane);
     };
-  }, [fitToBox, measure, shellId, connection, paneId]);
+  }, [fitToBox, measure, sessionKey, pane, paneId]);
 
   /* ---- Poll: one snapshot per frame, never one message per write --------- */
 
   useEffect(() => {
     let raf = 0;
     let inFlight = false;
+    // A poll was asked for while one was in flight: run it as soon as that one
+    // lands, or the keystroke waits for the next frame after all.
+    let again = false;
 
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
+    const poll = () => {
       const id = sessionId.current;
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
-      if (id === null || !ctx || inFlight) return;
+      if (id === null || !ctx) return;
+      if (inFlight) {
+        again = true;
+        return;
+      }
 
       inFlight = true;
       snapshotSession(id, generation.current)
         .then((snap) => {
           inFlight = false;
+          if (again) {
+            again = false;
+            queueMicrotask(poll);
+          }
+          // The pane switched sessions (shell picker) while this was in
+          // flight: the snapshot belongs to the old one.
+          if (id !== sessionId.current) return;
           if (!snap) return; // nothing changed — the common case
           generation.current = snap.generation;
           cursor.current = { row: snap.cursor_row, col: snap.cursor_col };
@@ -451,13 +557,21 @@ export function TerminalSurface({
           if (!snap.alive) setExited(true);
           setScrolled(snap.scroll_offset);
 
+          // The native view is showing: keep the rows (selection text, word
+          // select, the canvas fallback) but draw nothing.
+          const paints = !(gpu.current.live && !gpu.current.covered);
+
           if (snap.full) {
             // Scrolled or resized: viewport rows now hold different lines, so a
             // selection in viewport coordinates would point at the wrong text.
             clearSelection();
             lines.current.clear();
             for (const l of snap.lines) lines.current.set(l.row, l);
-            repaintAll(ctx);
+            if (paints) repaintAll(ctx);
+            return;
+          }
+          if (!paints) {
+            for (const l of snap.lines) lines.current.set(l.row, l);
             return;
           }
 
@@ -473,13 +587,139 @@ export function TerminalSurface({
         })
         .catch((e: unknown) => {
           inFlight = false;
+          again = false;
           setError(String(e));
         });
     };
 
+    /** Report this pane to the native renderer when anything it draws from
+     *  changes. One `getBoundingClientRect` and a string compare per frame. */
+    const syncGpu = () => {
+      const id = sessionId.current;
+      const wrap = wrapRef.current;
+      const ctx = canvasRef.current?.getContext("2d");
+      if (id === null || !wrap || !ctx || !gpuAvailable()) return;
+      const g = gpu.current;
+      const r = wrap.getBoundingClientRect();
+      const covered = r.width < 1 || r.height < 1 || coveredByOverlay(r);
+      if (covered !== g.covered) {
+        g.covered = covered;
+        // The overlay is up this frame; the native view hides one IPC later.
+        // Paint the canvas now so there is something under the overlay.
+        if (covered && g.live) {
+          repaintAll(ctx);
+          drawSelection();
+        }
+      }
+      const sel = selection.current ? ordered(selection.current) : null;
+      const state: PaneState = {
+        pane,
+        session: id,
+        rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+        dpr: window.devicePixelRatio || 1,
+        font_px: fontRef.current,
+        line_px: lineRef.current,
+        visible: !covered,
+        focused: document.activeElement === wrap,
+        selection: sel ? [[sel[0].row, sel[0].col], [sel[1].row, sel[1].col]] : null,
+        targets: (() => {
+          const { broadcast: on, tabId: tab } = bcast.current;
+          const tree = on && tab ? usePanes.getState().trees[tab] : undefined;
+          return tree ? sessionsFor(leaves(tree)) : [id];
+        })(),
+      };
+      const key = JSON.stringify(state);
+      // Unchanged: nothing to send, unless still waiting for the view to go live.
+      if (key === g.sent && (g.live || covered)) return;
+      if (g.inFlight) {
+        // A focus change must not wait a frame behind an in-flight update:
+        // keys typed meanwhile would go to the pane focus just left.
+        g.again = true;
+        return;
+      }
+      g.inFlight = true;
+      g.sent = key;
+      const settle = () => {
+        g.inFlight = false;
+        if (g.again) {
+          g.again = false;
+          syncGpu();
+        }
+      };
+      gpuPaneSet(state)
+        .then((info) => {
+          settle();
+          if (!info) {
+            // No GPU path here: back to the canvas, measured by the canvas.
+            const was = g.live;
+            g.live = false;
+            if (gpuCell.current) {
+              gpuCell.current = null;
+              cellRef.current = measure(ctx);
+            }
+            if (was) repaintAll(ctx);
+            return;
+          }
+          const cell = gpuCell.current;
+          if (!cell || cell.w !== info.cell_w || cell.h !== info.cell_h) {
+            gpuCell.current = { w: info.cell_w, h: info.cell_h };
+            cellRef.current = gpuCell.current;
+            const fit = fitToBox();
+            const sid = sessionId.current;
+            if (sid !== null && (fit.rows !== gridRef.current.rows || fit.cols !== gridRef.current.cols)) {
+              gridRef.current = fit;
+              quiet(resizeSession(sid, fit.rows, fit.cols));
+            }
+            if (!g.live || g.covered) repaintAll(ctx);
+          }
+          g.live = info.live;
+        })
+        .catch(settle);
+    };
+
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      poll();
+      syncGpu();
+    };
+
+    pollNow.current = poll;
+    syncNow.current = syncGpu;
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [clearSelection, paintCursor, paintRow, repaintAll]);
+    return () => {
+      pollNow.current = () => {};
+      syncNow.current = () => {};
+      cancelAnimationFrame(raf);
+    };
+  }, [clearSelection, drawSelection, paintCursor, paintRow, repaintAll, fitToBox, measure, pane]);
+
+  // The native view belongs to this mount. A remount (tab switch, split)
+  // attaches a new one; the session itself lives on (§18.18).
+  useEffect(
+    () => () => {
+      gpuPaneRemove(pane);
+      gpu.current = { live: false, covered: false, inFlight: false, again: false, sent: "" };
+    },
+    [pane],
+  );
+
+  // Rust typed a key here natively: clear the selection, as typing always has.
+  useEffect(() => {
+    let off: (() => void) | null = null;
+    let cancelled = false;
+    listen<string>(NATIVE_KEY_EVENT, (e) => {
+      if (e.payload === pane) clearSelection();
+    })
+      .then((f) => {
+        if (cancelled) f();
+        else off = f;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, [pane, clearSelection]);
 
   /* ---- Resize ------------------------------------------------------------ */
 
@@ -519,7 +759,7 @@ export function TerminalSurface({
       const id = sessionId.current;
       if (id !== null && (rows !== gridRef.current.rows || cols !== gridRef.current.cols)) {
         gridRef.current = { rows, cols };
-        void resizeSession(id, rows, cols);
+        quiet(resizeSession(id, rows, cols));
       }
       repaintAll(ctx);
     });
@@ -543,7 +783,7 @@ export function TerminalSurface({
       gridRef.current = { rows, cols };
       // The shell must be told, or it keeps wrapping at the old width and the
       // output no longer matches the pane.
-      void resizeSession(id, rows, cols);
+      quiet(resizeSession(id, rows, cols));
     }
     repaintAll(ctx);
   }, [fontPx, lineHeight, fitToBox, measure, repaintAll, clearSelection]);
@@ -557,7 +797,7 @@ export function TerminalSurface({
     // deltaY > 0 is "toward the user" = forward in time = out of history.
     const lines = e.deltaMode === 1 ? e.deltaY : e.deltaY / 40;
     const delta = Math.round(-lines * 3);
-    if (delta !== 0) void scrollSession(id, delta);
+    if (delta !== 0) quiet(scrollSession(id, delta));
   }, []);
 
   /** Where keystrokes and pastes go: this pane, or every pane in the tab while
@@ -611,7 +851,7 @@ export function TerminalSurface({
     // action. Shift+PageUp/Down is the convention every terminal uses.
     if (e.shiftKey && !e.ctrlKey && (e.key === "PageUp" || e.key === "PageDown")) {
       const page = Math.max(1, gridRef.current.rows - 1);
-      void scrollSession(id, e.key === "PageUp" ? page : -page);
+      quiet(scrollSession(id, e.key === "PageUp" ? page : -page));
       claim();
       return;
     }
@@ -620,7 +860,11 @@ export function TerminalSurface({
     if (!bytes) return;
     claim();
     clearSelection();
-    for (const target of targets()) void writeSession(target, bytes);
+    for (const target of targets()) {
+      // Repaint as soon as the write lands: the prediction is in the next
+      // snapshot (§5.4 input path).
+      quiet(writeSession(target, bytes).then(() => pollNow.current()));
+    }
   }, [clearSelection, paste, selectedText, targets]);
 
   /* ---- Mouse: select, copy to PRIMARY, middle-click paste ---------------- */
@@ -699,7 +943,15 @@ export function TerminalSurface({
       className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-chassis-900"
     >
       <div className="flex h-tabstrip shrink-0 items-center gap-2 border-b-hairline border-bezel-500 bg-chassis-800 px-2">
-        {connection ? (
+        {source ? (
+          <>
+            <span aria-hidden className="h-[6px] w-[6px] rounded-full bg-amber-500" />
+            <span className="num text-micro text-text-hi">{streamTitle(source)}</span>
+            {isReadOnly(source) && (
+              <span className="font-condensed uppercase text-eyebrow text-text-lo">read-only · follow</span>
+            )}
+          </>
+        ) : connection ? (
           <>
             {/* Cyan is link state, and a live SSH session is exactly that (§0.2). */}
             <span aria-hidden className="h-[6px] w-[6px] rounded-full bg-cyan-400" />
@@ -778,7 +1030,7 @@ export function TerminalSurface({
             type="button"
             onClick={() => {
               const id = sessionId.current;
-              if (id !== null) void scrollSession(id, -1_000_000);
+              if (id !== null) quiet(scrollSession(id, -1_000_000));
             }}
             className="num rounded border-hairline border-amber-500 bg-amber-900 px-[5px]
                        text-micro text-amber-500"
@@ -794,6 +1046,8 @@ export function TerminalSurface({
         role="application"
         aria-label="Terminal"
         onKeyDown={onKeyDown}
+        onFocus={() => syncNow.current()}
+        onBlur={() => syncNow.current()}
         onWheel={onWheel}
         onMouseDown={onMouseDown}
         className="term relative min-h-0 flex-1 cursor-text outline-none focus-visible:outline-none"

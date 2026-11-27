@@ -1334,6 +1334,928 @@ terminal modes and re-encodes input itself. A raw Unix PTY does none of that.
 
 ---
 
+## Phase 15 — Docker, Kubernetes, Databases
+
+Built on request ahead of §17's order; see D-26. Every module is live and verified
+against a real service, not a mock.
+
+### Shared pieces
+
+| Piece | Where | Notes |
+|---|---|---|
+| **Stream session backend** | `app/src/session.rs` (`StreamIo`, `spawn_stream`) | Container and pod exec/logs are ordinary terminal sessions, fed by plain tokio channels (D-27). Logs get LF→CRLF, since there is no PTY to do `onlcr`. Read-only streams drop keystrokes. Closing the tab closes the producer. |
+| **`DataTable`** | `src/components/DataTable.tsx` | Rows are pulled by index (`rowAt`), so a million-row result can stay in Rust. Virtualised, keyed rows, sticky header, resizable columns, keyboard navigation. Sort is the caller's job. |
+| Tab `source` | `lib/streams.ts`, `state/sessions.ts` | A tab can be "exec into X" or "logs of Y". Splitting that pane opens a second exec. |
+| `ModuleKit` | `src/components/ModuleKit.tsx` | Header, status dot, two-step confirm for destructive actions, filter box, generation poll hook. |
+
+### Docker — `crates/core-docker`, `app/src/docker.rs`, `DockerPanel.tsx`
+
+- **Endpoint resolved like the docker CLI:** `DOCKER_HOST`, then `DOCKER_CONTEXT`
+  or `currentContext`, then the default socket. bollard's own default only looks
+  at `/var/run/docker.sock`, which **does not exist under Docker Desktop for Linux**.
+  The development machine is that setup, so the obvious implementation would have
+  reported "Docker not running" with Docker running.
+- **Live list from the events API, never polled (§10).** A burst of events
+  (`compose up`) is coalesced into one re-list. CPU and memory come from one stats
+  stream per running container, using `docker stats` arithmetic (page cache
+  excluded). Reconnects use exponential backoff with jitter (§8.3).
+- Actions: start, stop, restart, pause/unpause, remove (two-step confirm). Exec
+  shell (bash, falling back to sh) and logs follow, both as terminal tabs.
+- Container ids are validated against Docker's name grammar before any request.
+  bollard puts the id straight into the URL path, so `../` would reach another API
+  endpoint.
+- Commands that wait on the daemon are `async`. Tauri runs sync commands on the
+  main thread, and `docker stop` waits out a 10 s grace period.
+
+### Databases — `crates/core-db`, `core-store/src/databases.rs`, `app/src/db.rs`, `DatabasesPanel.tsx`
+
+- **Postgres** (tokio-postgres): binary protocol, and a real cursor (portal inside
+  a transaction). Values are decoded by OID without chrono/uuid/decimal crates:
+  numeric, date, timestamp(tz), time, interval, uuid, json(b), inet/cidr, bytea,
+  1-D arrays, enums, domains.
+- **MySQL/MariaDB** (mysql_async, pure-Rust deflate). The stream pauses between
+  chunks under TCP backpressure. Cancel sends `KILL QUERY` over a second connection.
+- **SQLite** (rusqlite, bundled) runs on its own thread. A file is never created
+  if missing. Scripts run statement by statement; see below.
+- **Results never leave Rust.** Rows arrive in 500-row chunks into typed Arrow
+  columns. The engine parks until the UI scrolls near the end. Sort and filter
+  run in Rust over the whole result (arrow kernels, not DataFusion: D-28). Only
+  the painted window is formatted and sent. A sort or filter switches the cursor
+  to 20k-row fetches, so a bulk load over WAN costs tens of round trips, not
+  hundreds.
+- Saved profiles live in `databases.toml`. **The model has no password field**:
+  passwords are vault references or typed per connect. SQLite paths are stored as
+  `~/…` (§12.2).
+- A new query cancels the running one. The session is one connection, so `SET`
+  and temp tables persist between queries.
+- No TLS yet (D-30). The panel warns when a profile points at a non-loopback host.
+
+Bugs the tests caught:
+- **rusqlite's `prepare` silently drops everything after the first statement.**
+  "create; insert;" reported success having only created the table.
+- Counting statements first doesn't work either: preparing statement 2 fails
+  before statement 1 has created its table. Scripts now run statement by statement.
+- The first sort reported **18 400 ms**, which was mostly the cursor waiting for
+  me to scroll. Reported time now excludes parked time.
+
+### Kubernetes — `crates/core-kube`, `app/src/k8s.rs`, `KubernetesPanel.tsx`
+
+- Reads kubeconfig the way kubectl does (`$KUBECONFIG`, then `~/.kube/config`), so
+  contexts and exec auth plugins work.
+- **Informer per (context, kind, namespace)**, using the watcher's WatchList
+  bootstrap and falling back to List+Watch on the first failure. The store is
+  keyed by UID and a relist swaps in atomically. An informer nobody samples for
+  60 s is dropped, closing its watch.
+- Pods, Deployments, Services, Nodes, plus Namespaces for the picker. The STATUS
+  column follows **kubectl's rules**: `CrashLoopBackOff`, not the phase "Running".
+- Pod exec (sh, `TERM` exported, resize forwarded), logs follow with a container
+  picker, delete pod, deployment scale ± and rollout restart, YAML view without
+  `managedFields`.
+- JSON, not protobuf (D-29). TLS is rustls with the `ring` provider, per §18.7.
+
+### Verified
+
+- `cargo test --workspace`: **267 passed**, 0 failed (was 227).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `npm run typecheck`, `lint`, `build`, `test:keys`: clean.
+- **Live suites**, all passing. Run with `--ignored`; setup is in each file's header.
+  - `core-docker/tests/live.rs`: against Docker Desktop through the `desktop-linux`
+    context. It creates a labelled container, sees it through events, gets stats,
+    execs (sh fallback on alpine), follows logs, stops it, removes it, and checks
+    that an invalid id is refused.
+  - `core-db/tests/live.rs`: against Postgres 16 and MySQL 8.4 containers. It
+    checks:
+    - the cursor parks after one chunk;
+    - sort and filter in Rust;
+    - DML affected counts and server error text;
+    - a 30 s `sleep` is cancelled by the next query;
+    - 10 Postgres types decode exactly.
+  - `core-kube/tests/live.rs`: against a kind cluster (k8s 1.34). The informer ran
+    in **watchlist** mode. It covers pod to Running, logs, exec with
+    `TERM=xterm-256color`, scale to 2/2, rollout restart, YAML, and a deleted pod
+    leaving the store.
+- **Timings** (release build, 200k-row Postgres table, local container):
+
+  | | |
+  |---|---|
+  | first 500 rows | 4.3 ms |
+  | load all + sort | 366 ms |
+  | sort only | 2.1 ms |
+  | substring filter | 36 ms |
+
+- **In the real app** (nested Xephyr display, scratch config and kubeconfig):
+  - Docker: your 6 containers listed with live CPU/memory. A container started
+    from the CLI appeared without a refresh. Exec, logs, stop and remove all worked
+    from the panel.
+  - Databases: connect with a typed (unsaved) password. 200k rows stream as you
+    scroll. Sorting by amount loaded and sorted everything.
+  - Kubernetes: the list showed "watching · watchlist". Pod exec, scaling to 3/3
+    (confirmed with the cluster's own kubectl) and the YAML view all worked.
+- **Binary size: 8.6 MB → 22.9 MB** (release, fat LTO, stripped), measured with
+  `cargo build --release -p opspilot-tauri`. This is the largest cost of the phase.
+  The contributors are kube + k8s-openapi (generated API types), arrow, bundled
+  SQLite, mysql_async and bollard. A per-crate breakdown needs `cargo bloat`, which
+  is not installed here. §3 wants engine crates behind feature flags; they are not
+  yet, so a build without Kubernetes is not possible today. That is the obvious
+  first lever if size matters.
+
+### NOT done
+
+- REST/API client and log viewer modules (still placeholders).
+- Database TLS (D-30), CSV export, schema browser and autocomplete, query history.
+- Docker: images, volumes, networks, and `ssh://` endpoints.
+- Kubernetes: protobuf (D-29), other kinds (StatefulSets, Jobs, ConfigMaps,
+  Ingress…), events, port-forward, multi-container log merge.
+- The inspector labels exec and log sessions "local #N".
+
+---
+
+## Phase 16 — Leak and robustness audit
+
+Three independent reviewers read the code cold: the Rust session/Docker/Kubernetes
+layer, the database stack, and the frontend lifecycles. Each finding acted on was
+verified against the code first, and against the library source wherever the
+behaviour depended on it (bollard, kube-client, tokio-postgres, mysql_async,
+rusqlite, portable-pty, tokio). Most of the high-severity findings predate this
+session.
+
+### High severity — fixed
+
+| Finding | Fix |
+|---|---|
+| **Switching tab or module, or splitting a pane, killed the running shell** and opened a new one. The terminal component owned the session, and React unmounts components for layout reasons. | Sessions belong to **panes** (`state/terminals.ts`). A mount reattaches; only closing the pane or tab ends the session. Snapshot `since == 0` is always a full repaint. |
+| **Every SSH, exec or log pane opened two sessions and leaked one.** Shell discovery changed `shellId`, which re-ran the open. | Shells are only discovered for local panes. The open is keyed on what is opened. |
+| **An open still in flight when its pane closed leaked forever.** | The pane store closes a late open the moment it resolves. |
+| **Postgres: a SELECT committed or rolled back the user's own transaction** (`BEGIN; DELETE …;` then a check). | Probe with a savepoint. Inside a user transaction, the cursor runs in `SAVEPOINT` and the outer handle is never dropped (its Drop sends ROLLBACK). |
+| **A parked cursor held its transaction (Postgres) or metadata lock (MySQL) indefinitely**, blocking VACUUM and `ALTER TABLE`. | Parked cursors close after 60 s idle (`PARK_LIMIT`). Fetched rows stay on screen and the status says so. |
+| **Kubernetes/Docker exec deadlocked on a paste.** One loop wrote stdin and read stdout; kube's attach buffers are 1 KiB. Closing the tab did not free it. | Separate reader and writer tasks; the reader aborts the writer. kube buffers raised to 64 KiB. Live test: 1 MB paste with echo through a Docker exec. |
+| **A webview reload leaked every session**: shells, SSH channels, DB connections and their transactions, watches. | `app_reset`, awaited before first render. Verified by reloading the real app: both shells and the Postgres connection were released. |
+| **Sync commands did network, disk and KDF work on the UI thread.** An SFTP transfer froze the window for its full length; an SSH connect to a dead host for ~2 min; vault unlock for the KDF. | 35 commands moved to the blocking pool (`blocking()` in `lib.rs`). Only in-memory commands remain sync. |
+| **DB sort/filter could freeze the UI thread** (a mutex held through a 2 M-row sort; `cancel` building the view). | The view is built outside the lock from a snapshot and installed only if still current. `cancel` reads atomics. DB commands are async. |
+| **No byte limit on a result; one large chunk could abort the app** (an Arrow string offset over 2 GiB panics, and release is `panic = "abort"`). | 512 MB budget. Chunks flush at 64 MB. Cell display is truncated at 16 KB; export is not. |
+| **The PTY writer blocked the UI thread** when the program stopped reading stdin. | Writer thread behind a bounded channel; a full queue is refused with an error. Test: 8 MB into a program that reads nothing returns an error and does not hang. |
+
+### Medium and low — fixed
+
+- **Terminal sessions:**
+  - A PTY reader leaked (thread plus screen) when a detached job held the PTY slave. It now polls with a timeout. Tested with `setsid sleep`.
+  - Close SIGHUPs the foreground process group.
+  - The child is reaped without holding the lock, and never signalled once reaped, so a recycled PID can't receive it.
+  - Spawn error paths kill the child.
+- **Docker:**
+  - The watch is dropped after 60 s unsampled. It used to run one stats stream per container forever.
+  - Events are lifecycle only; healthcheck execs caused constant re-lists.
+  - Reconnect backoff resets after a successful connection.
+  - The endpoint is cached while the daemon is down.
+- **Kubernetes:**
+  - Informers are swept on a timer, not only while the panel is visible.
+  - Non-watch calls time out after 30 s; kube's default read timeout is none.
+- **Database:**
+  - Cancel could be lost (missed-wakeup race).
+  - A superseded query is never executed.
+  - A server-side cancel is sent only if something is actually executing; a parked cancel used to kill the *next* query (live-tested on both engines).
+  - MySQL: a bounded drain plus `KILL QUERY` after an early stop. An abandoned connection is closed off-runtime, because on-runtime mysql_async drains the pending result forever.
+  - SQLite: an interrupt handle (Cancel stops a running statement), `busy_timeout`, and a bounded job queue.
+  - Postgres: a connect timeout covering startup and auth, plus keepalives. Infinite intervals no longer overflow, and a hostile array header no longer triggers a 50 GB allocation.
+  - The data mutex is no longer locked once per row.
+  - A dropped Sink marks its query done.
+  - Profile file I/O is off the UI thread.
+- **Frontend:**
+  - A Kubernetes context switch kept the old cluster's rows on screen, so actions could hit the wrong cluster. Poll data now resets on source change.
+  - Confirm buttons are bound to their target; armed on A could remove B.
+  - DB connect: double-open, unmount and reconnect races; out-of-order run results.
+  - The idle DB poll re-rendered 5×/s. The k8s list re-sorted every second for the age column.
+  - Column-resize listeners leaked, and a resize toggled the sort.
+  - Split drags stuck after Alt-Tab.
+  - Unhandled rejections from keystrokes into exited sessions.
+  - Module panels stay mounted, so leaving Databases no longer drops the connection. Hidden panels pause polling, so the backend's idle sweep releases their watches.
+- Clipboard reads time out after 5 s; pastes over 32 MiB are refused.
+
+### Verified
+
+- `cargo test --workspace`: **276 passed**, 0 failed. New regression tests:
+  - writes never block;
+  - the reader exits with a detached job holding the PTY;
+  - `close_all`;
+  - lost-cancel race;
+  - idle park closes (virtual time);
+  - byte budget and chunking;
+  - dropped Sink;
+  - infinite interval and hostile array;
+  - paste cap.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- **Live:**
+  - DB suite (6). New tests: a user transaction survives a SELECT and a failed SELECT; a parked cancel spares the next query on Postgres and on MySQL.
+  - Docker suite (2), with the 1 MB paste.
+  - A benchmark test that hung forever on a missing table now has deadlines.
+- **Real app** (nested display; each result read from shell-written files and server state, not pixels):
+  - The same shell PID survived a module round-trip and a split, and the original pane kept its history.
+  - A background tab kept running.
+  - Closing a tab killed both of its shells.
+  - The DB connection survived module switches (same server backend pid).
+  - A webview reload released all shells and the Postgres connection.
+
+### Not fixed — known
+
+All four items are closed by Phase 17, except live-testing the Kubernetes exec.
+
+---
+
+## Phase 17 — Closing the Phase 16 leftovers
+
+### Fixed
+
+| Item | Fix |
+|---|---|
+| **SSH shell channels were unbounded** (§13.1 rule 7). A server that stopped reading let typed or pasted input queue without limit. | Bounded input (256 batches) and output (64 packets, at most 4 MiB). Input is **refused**, not queued, once the remote stops reading. Resize is a watch (latest wins, never dropped). Reader and writer are separate tasks, the same paste-deadlock fix as the Docker/K8s execs. Close stops both tasks even mid-write against a stalled server. The remote-forward queue is bounded too (a 64-connection backlog, past which connections are refused). |
+| **SSH connect had no timeout of its own.** A host that drops SYNs took ~2 min; one that accepts TCP but never speaks SSH waited forever. | `Timeouts { connect: 20 s, auth: 90 s }`. Auth is longer because it can wait on a person (a hardware-key touch). `Transport::connect_with` takes custom values. |
+| **Exec'd processes outlived their tab.** Closing a Docker or Kubernetes exec does not hang anything up, so `top` and `tail -f` kept running in the container. | The exec wrapper exports `OPSPILOT_SESSION=<token>.$$`. When the user closes the tab, one more exec runs `exec_hangup.sh`. It reads the shell's pid back from any process carrying the token and SIGHUPs that **one session**, which is what a terminal hangup does. As with a local terminal, `nohup` survives, a `setsid` daemon survives, and a scrubbed environment (`sudo`) is still caught. It never signals its own session or PID 1's. Docker skips it if the exec has already ended. |
+| **The Kubernetes client cache was never invalidated on 401.** After a token revocation, cert rotation or re-login, every call kept failing with the stale client. | Credential failures (API 401, 401 on the exec websocket upgrade, a failed exec auth plugin) produce one recognisable error. Actions, YAML, exec and logs drop the cached client on it. A watch failing on credentials gets its client and informer rebuilt, at most once per 15 s. 403 is **not** treated as a credential failure, because RBAC denials are not fixed by re-authenticating. |
+
+### Verified
+
+- `cargo test --workspace`: **284 passed**, 0 failed (was 276). New tests:
+  - `core-ssh/tests/integration.rs`: a host that accepts TCP and never speaks fails with "no SSH answer" instead of hanging. A stalled server gets input refused within bounds, and close still ends the output stream.
+  - `core-docker/tests/hangup.rs`: the hangup script against real processes on this machine, run under **both dash and busybox ash**. It hangs up the leader, a background job and an env-scrubbed job. A `setsid` daemon, another tab's session and an unrelated process survive. An unknown token signals nothing; a missing token exits 2.
+  - core-kube: 401 versus 403/404/409/500, the upgrade 401, all watcher error variants, and the wrapper/token format.
+- The first version of the script also killed `setsid` daemons, because they inherit the token. The test caught it, and the script now targets the recorded session only.
+- Clippy `-D warnings`: clean.
+
+### Not done
+
+- **Live runs.** Docker Desktop was not running and `kind`/`kubectl` are not installed, so neither the Docker nor the Kubernetes live suite ran this round. The hangup is proven against real processes but not yet inside a real container. The Phase 16 Kubernetes exec split is still not live-tested.
+- The hangup needs `sh`, `tr` and `cat` in the image. Distroless images have no shell to exec into in the first place.
+
+---
+
+## Phase 18 — Predictive echo on a real link, and SSH agent auth
+
+### Agent auth
+
+`core-ssh` could already authenticate through an agent, but the app never
+offered it: `remote.rs` built only a key-file method and a password method.
+
+- Order is now **configured key → agent → password**. A configured key goes
+  first because each rejected agent key counts against the server's
+  `MaxAuthTries`.
+- `Identity::use_agent` defaults to on, as with `ssh`, and is written to TOML
+  only when off, so existing workspace files do not change.
+- The connect dialog shows whether an agent is running and how many keys it
+  holds (`ssh_agent_status`: public keys and comments only). The host editor
+  has a per-identity toggle.
+- Agent discovery is one function shared by auth and status (`agent::connect`,
+  type-erased with `AgentClient::dynamic`). The Windows branch is unchanged
+  apart from `.dynamic()`; no Windows target is installed here, so it was not
+  compiled.
+
+### Predictive echo: wired, then fixed
+
+The predictor was already in the SSH session path (`write` → `predict`, output →
+`reconcile`). Pending 1.6 was stale on that point, but the feature had never run
+over a real link. The new live harness (below) ran it, and found three bugs:
+
+| Bug found live | Fix |
+|---|---|
+| **Every character typed at a password prompt was drawn** (`read -s`: 9 of 9). Echo-off was inferred from timeouts, but timeouts were only checked when output arrived, and a password prompt sends none. | **Epochs** (Mosh's rule). After Enter, any key that is not predicted, a paste, a mismatch, a resize, or output that moved the cursor with nothing predicted, new predictions are **held**: tracked but not drawn until the server echoes one. A no-echo prompt never confirms an epoch, so nothing typed into it is drawn. An echo from an older epoch cannot reveal a newer one. Held predictions are scored as `withheld`, outside the hit rate, so `sudo` prompts cannot push a session toward the 85% shut-off. Timeouts now also fire from the frame poll, not only on output. |
+| **Several backspaces flickered**: 3 typed together scored 1 hit and 2 misses. Arrival was "server cursor at or past the target", which is wrong for leftward moves. | A run of predictions is confirmed when the server cursor is **exactly** where one of them left it and every cell they touched holds the predicted glyph, applied in order. A coincidental cursor match with the wrong cells is neither a confirm nor a miss. |
+| **A whole line in one write (snippet, broadcast) skipped the epoch.** The queue (12) filled, and the Enter past the cap was never examined. The echo and the prompt arriving in one chunk then confirmed the epoch, and **7 of 9** password characters were drawn. It only appeared on the fourth live run. | Bytes left over past the cap start a new epoch if any of them is not printable. The regression test feeds the echo and the prompt as one chunk, and fails without the fix. |
+
+Also: the frontend now polls a snapshot as soon as a keystroke's write resolves,
+instead of waiting for the next animation frame (§5.4 input path). That removes
+up to one frame of delay. It is not measured here, because the harness sees the
+backend only.
+
+### The live harness: `crates/app/tests/live_ssh.rs`
+
+`cargo test -p opspilot-app --test live_ssh -- --ignored --nocapture`
+
+It runs unprivileged and self-contained:
+- real `sshd` running as the user on a free loopback port;
+- a private `ssh-agent` holding a throwaway key;
+- a TCP proxy adding 100 ms each way (§4's 200 ms RTT row, without root for `tc`).
+
+It connects through `remote::connect` with **agent auth only**, opens a session
+through `registry()`, and types into real shells. It never touches the user's
+agent, keys or `known_hosts` (`SSH_AUTH_SOCK` is explicit on every command, and
+`OPSPILOT_CONFIG_DIR` points at the temp dir).
+
+Results, three consecutive runs (OpenSSH 10.6, 200 ms RTT):
+
+| | visible P50 | visible P99 | server echo P50 | hit rate |
+|---|---|---|---|---|
+| bash `--norc` | 53–83 µs | 202–203 ms | 203 ms | **100%** (73/73) |
+| zsh `-f` | 53–116 µs | 202–203 ms | 203 ms | **100%** (19/19) |
+| the user's own zsh (syntax highlighting + autosuggestions) | 65–101 µs | 204–205 ms | 204 ms | **100%** (57/57) |
+| password prompt (`read -s`) | — | — | — | **0 of 9** characters ever drawn |
+
+- Connect plus agent auth through the proxy: 1.04 s (about 5 round trips).
+- **"Visible" is the backend half** (keystroke → glyph in the snapshot). The
+  webview adds one IPC round trip and a canvas paint, which this harness cannot
+  see. §4's "< 8 ms" row is therefore met by the backend with a wide margin and
+  is still **unproven end to end**.
+- **P99 is one round trip by design.** The first key of each line is held until
+  the server echoes it; every key after it is instant. §1's "20–40×" holds for
+  typing within a line. For the first key of each line, no terminal can do
+  better than the server's echo without risking a drawn password.
+
+### Verified
+
+- `cargo test --workspace`: **299 passed**, 0 failed.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- core-term: 12 new predictor tests (7 for epochs, 4 for exact-position
+  arrival, 1 for the queue cap). The 400-case convergence proptest still passes.
+- core-ssh: agent auth against a **real `ssh-agent` process**, covering an empty
+  agent, a loaded agent, the status listing and no agent.
+- app: method order with and without the agent; `use_agent` TOML round trip;
+  held predictions are not in the snapshot and do not move the caret.
+
+### Not done
+
+- End-to-end keystroke → pixel timing (needs the webview; see 1.1).
+- `Kind::CursorOnly` still has no emitter beyond Left/Right.
+- A hardware-key agent (touch to sign) was not tested. The 90 s auth timeout
+  is sized for it.
+
+---
+
+## Phase 19 — The SFTP transfer queue (§6)
+
+`crates/core-sftp` was a 20-line skeleton. It is now the transfer engine, and
+the app has a queue in front of it.
+
+### What picks the method
+
+| Request | Method | Why |
+|---|---|---|
+| one file (download) | **pipelined**: AIMD request window with slow start and a BDP ceiling (§6.1) | bounded by requests in flight, not bandwidth |
+| one file ≥ 16 MiB (upload) | **striped** over 8 channels, disjoint ranges of one part file | the *server's* per-channel window caps one channel (see below) |
+| directory, > 200 files averaging < 1 MB, server has `tar` | **tar-pipe** over an exec channel (§6.2) | ~4 round trips per file is the cost, not bytes |
+| any other directory | **parallel** SFTP, 4–8 channels, largest file first | one big file must not hold up the rest |
+
+The method is shown on every transfer row (§6.2). If `tar` is missing on the
+server, the transfer falls back to parallel SFTP and the row says so.
+
+### Measured (`core-sftp/tests/sshd.rs`, OpenSSH 10.6, 40 ms RTT proxy, no loss, release)
+
+| | result | vs WinSCP-style |
+|---|---|---|
+| download, 1 request in flight × 32 KiB (WinSCP) | 0.7 MB/s | base |
+| download 32 MiB, pipelined | 75 MB/s (includes ~6 RTT setup) | **104×** |
+| download 128 MiB, pipelined | **195 MB/s**; a fixed 128-request window: 220 | |
+| upload 128 MiB, 1 channel / 4 stripes / **8 stripes** | 41 / 96 / **129 MB/s** | |
+| local ceiling (no added latency) | download 744–832 MB/s, upload 412–616 MB/s | |
+| 2,001 × 4 KiB, sequential SFTP | 6 files/s (10k files: 29 min) | base |
+| 2,001 × 4 KiB, 8 parallel channels | 46 files/s | 8× |
+| 2,001 × 4 KiB, **tar-pipe** | **2,853 files/s** (10k files: 3.5 s) | **~500×** |
+
+§4's "≥ 30× WinSCP" for small files is met by a wide margin. §4's "≥ 90% of
+1 GbE" is **not proven**: there is no 1 GbE link here. Through 40 ms of
+latency the download reached 195 MB/s and the striped upload 129 MB/s.
+
+### Found by measuring, not by reasoning (CLAUDE.md §18.23)
+
+- **The SSH channel window was the download cap, not the request window.** At
+  8 MiB, downloads stopped at 81 MB/s whatever the SFTP window; a deep fixed
+  window of 128 requests scored the same. russh refills a window only below half,
+  so the window must be about 2× the BDP. It is now 32 MiB: 219 MB/s.
+- **The server's 2 MiB window caps one upload channel** at about 50 MB/s at
+  40 ms. The client cannot change it, but every channel has its own, so large
+  uploads are striped over 8 channels.
+- **Slow start.** Growing +1 per round trip from 16 took about 18 round trips to
+  reach 34. Doubling per round trip until the first stall, still under the BDP
+  ceiling, took a 128 MiB download from 110 to 195 MB/s.
+
+### Bugs found on the way
+
+- **`russh-sftp`'s `FileAttributes::default()`** is size 0, uid/gid 0, mode
+  `0o777|DIR` (§18.22). As `fsetstat` attributes it **truncated every upload to
+  zero bytes**; the round-trip test caught it. On `open`/`mkdir` it asks for
+  mode 0777. A check that directories are not world-writable did **not** fail
+  with the bad value, because OpenSSH applies its umask, so that check was
+  removed rather than kept as false assurance.
+- **`~` in a key path was never expanded** (pre-existing). A saved identity with
+  `key_path = "~/.ssh/id_ed25519"` (the model's own example, and §12.2's rule)
+  could not connect. Found in the GUI test; fixed with `paths::resolve`, with a
+  test.
+- **The SFTP pane hid file names** below ~400 px width (pre-existing): the `1fr`
+  name column collapsed under the fixed columns. Names now keep 120 px and the
+  pane scrolls sideways.
+- **The pane did not refresh after a fast transfer.** A job that started and
+  finished between two idle (1 Hz) samples was never seen running. Any job
+  reaching `done` now counts, and queueing a transfer wakes the list at once.
+
+### Safety
+
+- Every file goes to `.name.opspilot-part` and is renamed into place
+  (`posix-rename@openssh.com` when replacing remotely). A failed or cancelled
+  transfer leaves nothing under the real name; tested by cancelling mid-file,
+  both in the suite and from the UI.
+- An existing target is refused unless "replace" is chosen. A directory then
+  merges.
+- **Server-supplied names are validated** before use: `..`, `/`, `\`, NUL
+  and empty names are refused and counted. Tar extraction uses `unpack_in`; a
+  test feeds a hostile archive with `../escaped.txt` and asserts it lands
+  nowhere.
+- Every path in a remote command is shell-quoted; a test round-trips
+  `$(rm -rf ~)`-style strings through a real `sh`.
+- Symlinks are never followed when uploading. The SFTP path skips them
+  (counted, shown); tar preserves them as links.
+- Mode bits are kept without setuid/setgid. Windows sends no mode rather than
+  inventing one (§18.11).
+
+### The queue (`crates/app/src/transfers.rs`, `TransferList.tsx`)
+
+- At most 2 jobs run at once; the rest queue in order. Commands are in-memory
+  only (§18.19). Progress is atomics sampled at 10 Hz while active and 1 Hz idle
+  (§13.1 rule 8). Rates are a 1 s EWMA (§14.6), with ETA, files done and
+  skipped counts.
+- Directories upload and download. The old whole-file, in-memory
+  `sftp_download`/`sftp_upload` commands are gone.
+- Transfers survive a webview reload: the queue is native and the new page
+  lists it.
+
+### Verified
+
+- `cargo test --workspace`: **320 passed**, 0 failed. New: AIMD (6),
+  tar/quoting/hostile archive (5), names/paths (4), the queue (2), key-path
+  expansion (1), and against real OpenSSH (4): file round trip with mode,
+  striped upload, directory round trip by both methods, overwrite refusal, and
+  cancel. The OpenSSH tests skip where `sshd` is not installed.
+- Clippy `-D warnings`, typecheck, lint, build, `test:keys`: clean.
+- **Real app**, nested Xephyr display, isolated `HOME` and config, against a
+  throwaway sshd behind a 40 ms (then 1 s) RTT proxy:
+  - a 191 MB upload ran "striped · 8 channels" in 1.2 s (`cmp` identical, mode
+    and mtime kept);
+  - a 2,500-file directory ran "batched · tar" in 0.7 s (`diff -r` identical);
+  - downloading it onto an existing copy failed with "already exists". "Replace"
+    merged it and restored a deliberately modified file;
+  - cancel mid-download (at 1 s RTT) left neither the file nor its part file.
+- `tests/live_ssh.rs` (predictive echo) moved to the shared fixture crate
+  `crates/test-sshd`. It still passes with the 32 MiB window.
+- **Binary size: 22.9 MB (Phase 15) → 24.2 MB** (release, fat LTO, stripped).
+  That +1.3 MB is everything since Phase 15, not this phase alone; most of it is
+  likely core-sftp and `tar`, but no per-crate breakdown was taken (`cargo
+  bloat` is not installed).
+
+### Not done
+
+- **Resume** (§6.5: persist offset and prefix hash, verify before resuming).
+  A cancelled or failed transfer restarts from zero.
+- **Merkle compare / delta sync** (§6.5), **speculative listing prefetch**
+  (§6.6), **io_uring/IOCP zero-copy and a buffer pool** (§6.3). Each chunk is
+  one allocation; the local ceiling above suggests it is not yet the limit.
+- Parallel SFTP for many small files is ~4 round trips per file per channel.
+  Tar-pipe covers the case that matters; a server without `tar` gets 8×, not
+  500×.
+- The helper agent (§6.7).
+- Packet loss is not simulated; the proxy only delays. The flaky-link
+  behaviour of AIMD's halving is unit-tested, not measured.
+- Panes do not watch for outside changes (pre-existing). They refresh after a
+  transfer or on "refresh".
+
+---
+
+## Phase 20 — GPU renderer (2026-11-26)
+
+`crates/render`, previously a placeholder, is now the renderer the
+`spike/wgpu-compose` measurements chose (docs/spikes/wgpu-compose.md on that
+branch), and on Linux/X11 the app draws terminals with it (part 2 below).
+
+### What is in it
+
+- **Font** (`font.rs`). JetBrains Mono NL, four faces, subset with fontTools to
+  the terminal's ranges and embedded (about 130 KB each, 4 faces; OFL text
+  alongside). No system lookup on cold start, and the cell size is identical on
+  every machine. Cells are **whole pixels** (7.5 px advance → 8), so every
+  column starts on a pixel and one bitmap serves every column. Hinted with
+  swash.
+- **Box drawing and blocks drawn to the cell** (`boxdraw.rs`). The font's box
+  glyphs span the em box; at line height 1.36 vertical strokes stop short of the
+  row and `tree` output comes out dashed. All light/heavy lines and junctions,
+  half lines, `═ ║` and every block element are drawn; dashes and the other
+  double-line junctions still come from the font.
+- **Atlas** (`atlas.rs`). 2048² R8, shelf-packed. ASCII pre-rasterized at start
+  (§5.7) with a direct-indexed fast path. No CPU mirror of the texture (4 MiB
+  saved), only an upload queue. A full atlas clears and bumps an epoch, and
+  frames built against the old epoch rebuild.
+- **Frame** (`frame.rs`). Rows → instanced quads, cached per row; only damaged
+  rows rebuild (§5.3). Layers: background runs (one quad per run, not per
+  cell), glyphs and underline/strike, cursor (block with the glyph inverted;
+  hollow when unfocused), selection. Reverse, dim, hidden, bold, italic, wide
+  characters.
+- **GPU** (`gpu.rs`, `shader.wgsl`). One pipeline, one draw call. Glyph quads
+  are pixel-aligned, so the shader fetches atlas texels directly with no
+  sampler. **One colour pipeline for every target** (non-sRGB format, gamma-space
+  blending like canvas and cairo). That fixes the brightness jump the spike
+  showed between its two paths. The alpha channel is blended so it stays 1;
+  plain alpha blending leaves `a² + 1 − a` under glyph edges, which the overlay
+  path would show as see-through text. Offscreen read-back for tests and the
+  overlay path.
+
+### Measured (`benches/frame.rs`, machine at load 25)
+
+| | time |
+|---|---|
+| full rebuild, dense 200×50 coloured screen | 0.46 ms |
+| one row changed (typing) | 9 µs |
+
+### Verified
+
+- 22 unit tests, plus 3 GPU tests on the real adapter (`tests/gpu.rs`: VT bytes
+  → screen → pixels): cell placement, colours, backgrounds, box drawing reaching
+  the cell edge, cursor inversion, selection blend, and **a damage-driven frame
+  is byte-identical to a full rebuild**. The GPU tests skip without an adapter.
+  `OPSPILOT_RENDER_DUMP=dir` writes the frames for a look by eye.
+
+### Found on the way: every webfont was missing a–z
+
+`scripts/vendor-fonts.mjs` picked fontsource's `latin-ext` slice as the "widest"
+subset. That slice has **no basic Latin at all**, so all seven bundled faces had
+no a–z and **the whole UI has been rendering in the system fallback face**
+(DejaVu here), with no error. The script now vendors `latin` and `latin-ext`,
+and `fonts.css` declares both with fontsource's unicode-ranges. JetBrains Mono
+now comes from `crates/render/fonts/`, so the canvas and GPU terminals draw the
+same face, and both have box drawing (Pending §5 item 1, now fixed). Checked by
+reading each file's cmap and by a `vite build`. **Not checked by eye in the
+running app.**
+
+### Part 2: wired into the app (`crates/app/src/gpu_term.rs`)
+
+- **One native child window per terminal pane**, created through GDK on the
+  main thread, click-through (empty input region), with a wgpu surface on it.
+  Present mode Immediate, else Mailbox, else Fifo.
+- **One render thread** (§13.2) owns the device, the atlas and every surface.
+  It draws a pane when its session's generation moves: coalesced to 60 Hz for
+  output (§5.4), and polled every 2 ms for the 50 ms after a keystroke
+  (`session_write` wakes it), so an echo or prediction is drawn as soon as it
+  exists. Idle cost measured: **0.4% of a core** for the thread.
+- **The webview keeps input, selection and layout.** Each frame it compares
+  the pane's rect, focus, selection, font and overlay state with what it last
+  sent, and calls `gpu_pane_set` only on a change. Cell metrics come from Rust
+  (whole pixels) and the canvas lays out the same grid.
+- **Overlays**: elements marked `data-overlay` (palette, connect dialog, host
+  editor, vault, tooltip) hide the child window of any pane they intersect.
+  The canvas, which keeps its rows current underneath, paints while hidden.
+  No compositing hook was needed, so the spike's C2 path is not used.
+- **Two damage consumers.** `Session`'s dirty flags became a per-consumer
+  bitmask (webview, GPU). With one shared flag, whichever consumer polled first
+  took the damage and the other drew stale rows. Test:
+  `snapshot_and_paint_do_not_steal_each_others_damage`.
+- **Falls back** to the canvas on Wayland, with no adapter, or off Linux, and
+  says why on stderr (`gpu terminal off, using the canvas: ...`).
+
+Checked in the real app on a nested Xephyr display (lavapipe, since Xephyr has
+no DRI3): colours, bold, underline, `ls --color`, `tree` joining across rows,
+drag selection drawn by the GPU, hollow cursor when unfocused, palette and
+dialog on top with the canvas showing under them, the child following window
+grow and shrink with the shell reflowing, and a 300,000-line `seq` ending on the
+right final state. Found and fixed on the way: the canvas selection layer could
+keep a stale highlight while hidden (now resynced whenever the canvas takes
+over). Workspace: **345 tests pass**, clippy `-D warnings`, typecheck, and lint
+are clean.
+
+### Keystroke → pixel, the real app on the real display
+
+Your X11 desktop (xfwm4 compositing, 1920×1080 at 60 Hz, Intel Iris Xe), a
+local zsh, debug build. Harness: `crates/app/src/latency_probe.rs`, built with
+`--features opspilot-app/latency-probe` and run with
+`OPSPILOT_LATENCY_PROBE=1` (add `OPSPILOT_GPU_TERM=0` for the canvas). It
+dispatches real GDK key events to the app's own window with
+`gtk_main_do_event`, so nothing goes to the desktop. A second X connection
+polls a pixel in the cursor's cell. The path measured is GTK → WebKit → the
+page's keydown → IPC → PTY → zsh echo → parse → draw → present → pixel.
+150 samples per run after 10 warm-up, keys 120–320 ms apart.
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| canvas (the old path) | 24.57 ms | 33.78 | 44.70 |
+| GPU, first cut (echo polled every 2 ms) | 7.16 ms | 9.39 | 18.82 |
+| **GPU, echo wakes the render thread** | **5.36 ms** | 8.27 | 14.87 |
+| *(a second run of the same)* | 5.42 ms | 8.50 | 20.61 |
+
+**4.6× faster than the canvas at p50.** It still misses §4's 5 ms p50, by
+0.4 ms, and its 12 ms p99. Where the time goes (p50, final build):
+
+| stage | p50 | p90 |
+|---|---|---|
+| key → `session_write` (GTK, WebKit, JS, IPC) | 1.53 ms | 2.01 |
+| write → draw (PTY, shell echo, parse, wake) | 0.23 ms | 0.37 |
+| draw → present (build, submit) | 0.91 ms | 1.10 |
+| present → pixel (driver, X server) | 2.72 ms | 5.28 |
+
+- **Found by the breakdown:** write → draw was a steady 2.1 ms. That was the
+  render thread polling for the echo every 2 ms, while the shell echoes in
+  about 0.2 ms. Session readers now wake the render thread directly
+  (`gpu_term::output`), but only for 50 ms after a keystroke, so floods stay
+  coalesced to frames. Saved 1.8 ms.
+- present → pixel and its tail are the driver and X server. Not investigated.
+
+### Keys handled natively (`crates/app/src/keys.rs`, `gpu_term::on_key_press`)
+
+The 1.5 ms of WebKit, page and IPC is gone for terminal keys. While a GPU pane
+is focused **and not covered by an overlay**, a GTK `key-press-event` hook on
+the toplevel runs before WebKit. It encodes the key in Rust, writes it to the
+session (every pane in the tab while broadcasting) and wakes the renderer. It
+swallows the matching key release, and tells the page (`term-native-key`) so
+typing still clears the selection.
+
+- `keys.rs` is a rule-for-rule port of `src/lib/keys.ts`, and its 8 tests are
+  the TS suite's cases. Both encoders stay: the page still handles the canvas
+  path and every key Rust passes on.
+- **Passed to the page untouched:** every Ctrl+Shift chord (palette, copy,
+  paste, close tab, and Ctrl+_ undo), Ctrl+PageUp/PageDown, Shift+PageUp/PageDown,
+  Shift/Ctrl+Insert, Ctrl+Alt+Left/Right, Alt+Shift splits, Ctrl+digits and
+  zoom, Super, dead keys, and anything without a known encoding.
+- **Overlay rule.** The native path stops while a palette or dialog covers the
+  pane, and the page decides where keys go. Focus reaches Rust asynchronously
+  from the page; without this rule, a key typed in that window could go to the
+  shell behind a dialog. One unexplained run in the nested display, never
+  reproduced in three exact replays, typed into the shell behind an open
+  palette. The rule makes that impossible from the native side.
+- Checked in the real app (nested display): typing, Ctrl+C interrupting
+  `sleep`, Up recalling history, `cat -v` showing `^[OA` / `^[[A` under DECCKM
+  on and off, `^[[1;5D`, `^[[Z`, `^[b`, the palette chord, typing in the palette,
+  selection cleared by a keystroke. (F5 arrived as Alt+F5 on *both* the native
+  and the old JS path there: xdotool reaches F5 through an Alt level in that
+  server's keymap.)
+- **Measured on the real display, machine idle, two runs:**
+
+  | | p50 | p90 | p99 |
+  |---|---|---|---|
+  | GPU, before native keys | 5.36 ms | 8.27 | 14.87 |
+  | **GPU, native keys** | **5.04 ms** | 7.85 | 19.42 |
+  | *(a second run of the same)* | 5.03 ms | 6.22 | 23.88 |
+
+  | stage | before | native keys (p50, p90) |
+  |---|---|---|
+  | key → write | 1.53 ms | **0.10**, 0.12 |
+  | write → draw | 0.23 ms | 0.26, 0.36 |
+  | draw → present | 0.91 ms | 0.83, 1.23 |
+  | present → pixel | 2.72 ms | **3.87**, 6.52 |
+
+  Key → write fell by 1.4 ms; p50 improved only 0.3 ms because present →
+  pixel came out 1.1 ms higher in the same runs. That stage follows the GPU's
+  power state (next section), so the 0.3 ms is within run-to-run drift. The
+  p99 tail is all present → pixel. (A run during a game read 11.69 ms and is
+  discarded.)
+- **Harness gotcha:** run it with a scratch `HOME` that has a `.zshrc`. With an
+  empty `HOME`, zsh opens its new-user wizard instead of a prompt, nothing
+  echoes, and the probe reports "keys never showed up".
+
+### Chasing present → pixel (what did not help, and why the numbers drift)
+
+With native keys the app's own stages total about 1.1 ms; the rest is after
+`present`. Tried, all on the real display, debug build unless noted:
+
+| change | p50 | verdict |
+|---|---|---|
+| Immediate (current) | 5.0 ms | keep |
+| Mailbox | 15.3 ms | 3× worse |
+| Fifo | 14.4 ms | 3× worse |
+| release build (fat LTO) | 5.00 ms | no change: dependencies already build at opt-level 3 in dev |
+| pre-wake: a trivial GPU submit when the key arrives | 5.06 / 5.08 vs 4.95 off | no gain, reverted: it moved 0.25 ms from submit onto the render thread just as the echo arrived |
+| a 250 µs gap between the probe's `GetImage` polls | 4.97 ms | the probe does not load the X server it measures |
+
+Split further: build 12 µs, acquire 0.1 ms, encode 0.13 ms, **submit
+0.42 ms**. Waiting for the GPU before presenting showed it takes about 1.7 ms
+to execute a frame of one clear and 2–3 quads at 1006×894: 1.8–2.0 ms cold,
+0.9 ms when submitted again immediately.
+
+**The GPU's clock is most of the gap, and area is most of the rest.** With
+the GPU free to idle at 100 MHz, each keystroke's frame is too short a burst
+for the driver to clock up for, and the results drift by more than any change
+above. Early runs suggested latency scales with surface area (2.64 ms p50 at a
+small window, 5.80 at a large one); an hour later, with the GPU idling at
+100 MHz instead of 1,100, interleaved runs gave the reverse (small 6.8 ms,
+default 5.3). Pinning the minimum clock at 800 MHz (`gt_min_freq_mhz`, root,
+a diagnostic only) made it repeatable, two interleaved rounds each:
+
+| GPU floor 800 MHz | p50 | p90 | present → pixel p50 |
+|---|---|---|---|
+| default, 1006×894 terminal | 3.16 / 3.19 ms | 3.60 / 4.13 | 1.86 / 1.87 ms |
+| small, 366×494 terminal | 2.12 / 2.11 ms | 2.52 / 2.52 | 0.82 / 0.85 ms |
+
+So about 2 ms of the 5 ms p50 is the GPU clock, and about 1 ms of what remains
+at the default size is drawing and copying the whole surface for a one-cell
+change. The reversal at 100 MHz fits the clock governor upclocking for large
+frames and never for small ones; that is a guess, not measured. **p99 is
+14–22 ms in every configuration**, clock and size alike, and is all present →
+pixel: a separate tail, not yet explained. Compare only interleaved A/B runs,
+log `/sys/class/drm/card0/gt/gt0/rps_cur_freq_mhz` with them, and check
+nothing else is busy (a browser tab at 180% CPU spoiled one round).
+
+Not possible:
+- Taking the child out of the compositor: a compositor
+  redirects the toplevel together with its children, and xfwm4 unredirects
+  only fullscreen windows.
+
+Probe switches (probe builds only): `OPSPILOT_PROBE_PRESENT=immediate|mailbox|fifo`,
+`OPSPILOT_PROBE_GPU_WAIT=1` (wait for the GPU before present; reports GPU time),
+`OPSPILOT_PROBE_POLL_US=n`, `OPSPILOT_PROBE_WINDOW=WxH`. The probe now quits
+through `app.exit`, the normal path: `process::exit` segfaulted in Mesa's exit
+handlers in 2 of about 12 runs, while `app.exit` was clean in 15 runs.
+
+### Damage-only presentation (`crates/render/src/present.rs`)
+
+wgpu's surface cannot present part of a window: it treats each acquired image
+as uninitialised (so it clears it) and does not expose
+`VK_KHR_incremental_present`, which the driver supports. So on Linux/Vulkan
+each pane owns its swapchain underneath wgpu:
+
+- The device is opened through wgpu-hal's `open_with_callback`, adding
+  `VK_KHR_incremental_present`, then handed back to wgpu.
+- `Frame` now tracks damage: rebuilt rows, the cursor's old and new rows, the
+  selection's old and new rows, everything after an invalidate. One band,
+  full width, widened a row each side for glyph overhang.
+- `Renderer::draw_damage` loads the previous canvas, fills the band with the
+  background and draws every instance scissored to it.
+- `Presenter` copies into each swapchain image the union of damage since that
+  image was last shown (a full copy if it is older than 16 frames or new),
+  and presents with the band as the region. One small raw command buffer;
+  the canvas goes back to the layout wgpu's tracker expects.
+- Falls back to wgpu's surface on any error; `OPSPILOT_GPU_DAMAGE=0` forces
+  that, for comparison.
+
+Verified: the GPU test `damage_only_frames_match_a_full_redraw` (typing,
+backspace, a new line, a selection appearing and moving, the cursor going
+unfocused: each damage-only frame equals a fresh full render, pixel for
+pixel); in the nested display, typing and editing mid-line, `seq 1 200000`,
+colours, `less` and back, a drag selection, focus loss, a split (remount and
+resize, two presenters on one device) and closing the tab.
+
+Two bugs found on the way:
+
+- **A window shown again kept stale pixels.** Showing a child queues the map
+  on GTK's X connection; the render thread presents on Mesa's. A present that
+  reaches the server first is dropped. wgpu's surface hid this by repainting
+  everything on the next change; a damage-only window never repairs it. Now
+  the map is followed by a round trip (`show_synced`) and an `Exposed`
+  message, and the next **two** frames present the whole window: with one,
+  2 of 6 palette open/close cycles still left the window's own pixels stale;
+  with two, 0 of 12. The old path measured 6 of 6 clean (it presented twice
+  by accident).
+- **Closing or splitting a pane segfaulted** (libgdk-3), on both paths and
+  since part 2. `gdk_window_destroy` unrefs the window, and the gtk-rs binding
+  passes a borrowed pointer, so dropping our handle freed it twice. Fixed in
+  `destroy_window`. Splits had not been exercised on the GPU path before.
+
+**Latency.** Four interleaved pairs on the real display, stock clock floor
+(100 MHz), machine quiet (load about 1):
+
+| | p50 of each run | median | p90 range |
+|---|---|---|---|
+| **damage-only** | 4.71, 4.68, 4.65, 4.67 ms | **4.67 ms** | 5.5–7.4 |
+| wgpu surface | 4.99, 4.93, 4.99, 4.95 ms | 4.97 ms | 5.5–8.2 |
+
+Damage-only won all four pairs, by about 0.3 ms, all of it in present →
+pixel (3.58 against 3.77 ms). Smaller than the ~1 ms the pinned-clock area
+test suggested: at the stock floor most of what is left is the idle GPU, not
+area. It puts p50 under §4's 5 ms in every run. **p99 is unchanged** (14–26 ms
+on both paths): that tail is not area either.
+
+An earlier set of pairs, with the machine busy (npm, a VM, another WebKit
+app; p90 18–26 ms everywhere), gave medians of 5.75 against 6.4 ms and one
+pair the other way: the same direction, unusable as a number.
+
+### The p99 tail is after the present, in the X server
+
+Three runs of 700–800 samples with a per-sample CSV
+(`OPSPILOT_PROBE_SAMPLES`, `OPSPILOT_PROBE_CSV`, which also records wall time
+and the probe's last `GetImage` round trip):
+
+- **The app's own part is small at p99.** Key → present: 1.09–1.14 ms p50,
+  **1.75–2.67 ms p99**, 5.6 ms max. Every slow sample is slow in present →
+  pixel.
+- **Our GPU work is not what waits.** With `OPSPILOT_PROBE_GPU_WAIT=1`, slow
+  samples finished our render *sooner* than fast ones (1.2 against 2.0 ms);
+  the time went after the present, in the X server answering the probe's
+  pixel read 7–16 ms late.
+- Slow samples were not tied to the key, the idle gap before it, or a 60 Hz
+  phase; they came about every 5 s, sometimes in bursts.
+- Other apps' GPU use (fdinfo, 50 ms timeline) was only 1.5× higher around
+  slow keystrokes than fast ones, 2.5% against 1.6% of the GPU: not it.
+- **With OpsPilot closed, the X server stalls the same way.**
+  `scripts/x-stall-monitor.c`, 90 s of 1 ms round trips: a plain round trip
+  never took over 10 ms (max 8.3), but one that syncs with the GPU (a 1×1
+  `GetImage`, the probe's kind of read) took over 10 ms **21 times**, max
+  16.1 ms, in bursts. Same size and rate as the probe's tail.
+
+So on this desktop (Xorg with glamor, xfwm4 compositing, Iris Xe at its idle
+clock) anything that waits for the GPU through the X server regularly waits
+10–16 ms.
+
+**But that is not the whole tail.** Compositor on/off, interleaved, 45 s of
+the monitor and 300 probe samples each, with other work going on:
+
+| | X stalls >10 ms | probe p50 | p90 | p99 |
+|---|---|---|---|---|
+| compositor on, round 1 | 71 | 4.38 ms | 7.0 | 14.2 |
+| compositor off, round 1 | 52 | 5.49 ms | 16.2 | 23.4 |
+| compositor on, round 2 | **1** | 4.60 ms | 7.8 | **19.4** |
+| compositor off, round 2 | 377 | (probe window was behind other windows) | | |
+
+- **Compositor off is worse.** The minimum rose from about 1.8 to 4.3 ms and
+  p90 to 16 ms: without a compositor the X server ties windowed presents to
+  vblank. Not a fix, and not something to tell users.
+- **In round 2 the monitor saw one stall in 45 s and the probe's p99 was
+  still 19.4 ms.** So general X server stalls make the tail worse when they
+  happen, but part of it is specific to presenting our window (Present on a
+  redirected window, both present paths). Not yet explained.
+
+The app's own share stays under 3 ms at p99 in every run.
+
+Dead end, recorded so it is not repeated: splitting present → pixel with
+the Present extension's `CompleteNotify`. For an immediate copy to a window,
+Xorg stamps the event with the last vblank's time, not the time it executed
+the copy, so only presents that a vblank happened to follow could be
+matched (11–20% of them, biased slow), and the split was meaningless. The
+code was removed.
+
+### Not done
+
+- **§4 latency budget:** p50 is met: 4.67 ms against < 5 ms at the GPU's
+  stock clock floor, with damage-only presentation. **p99 end to end is
+  not:** 14–26 ms against < 12 ms. The app's share of p99 is 1.8–2.7 ms; the
+  rest is after the present, in the X server: partly its own GPU-synchronised
+  stalls (present with the app closed), partly the present path for our
+  window, not yet explained (see "The p99 tail is after the present").
+  Compositor off is worse. Untested: a Wayland session.
+- **Release binary size cost unmeasured** (wgpu + swash + fonts).
+- Wayland, Windows and macOS use the canvas. HiDPI is coded (device-pixel
+  surfaces and font size) but untested.
+- Refresh rate is fixed at 60 Hz (§14.6 wants the panel's rate).
+- The webview still polls snapshots and serializes changed rows while the GPU
+  path draws. It needs them for selection text and the overlay fallback; a
+  text-only snapshot would cut that cost.
+- **No fallback fonts.** Anything outside the subset (CJK, emoji) draws as
+  U+FFFD. Needs a lazy system lookup, plus an RGBA atlas for colour emoji.
+- Rounded corners are drawn square; Powerline separators come from the font.
+- Cell metrics must come from Rust once the GPU path is live. The canvas
+  measures fractional advances (7.5 px) and would disagree on column count.
+
+---
+
+## Phase 21 — Predictive echo, measured on screen (2026-11-27)
+
+§4's WAN row ("keystroke → glyph, 200 ms RTT, < 8 ms") had only a backend
+number (~80 µs to the snapshot). Now measured end to end on the GPU path.
+
+### The harness
+
+`OPSPILOT_PROBE_RTT_MS=200` in the latency probe starts, in-process, a
+throwaway sshd and private agent (`opspilot-test-sshd`, probe builds only)
+behind a proxy delaying each direction by half the RTT. It opens the session
+as a user does (new-session button, the connect dialog, submit), types into
+the remote shell, and stops the server before quitting. Auth is the private
+agent only; the host key goes to the probe's scratch config dir.
+
+### What it found: a third of keystrokes waited a round trip
+
+First run, the developer's own zsh (Kali's default zshrc): **p50 4.77 ms,
+p90 218 ms, p99 476 ms, 32% of keys unpredicted.** zsh-syntax-highlighting
+and zsh-autosuggestions answer every key with the echo, a rewrite of it, a
+grey suggestion after the cursor, then `ESC[nD` back. The network split that
+echo across reads, and the move back, arriving alone with nothing predicted,
+hit the rule "output moved the cursor unprompted → new epoch" (it is how a
+password prompt printed without an Enter stays hidden). The next key then
+waited for the server.
+
+The live harness (`tests/live_ssh.rs`) had passed with the same zsh: its keys
+are spaced further apart than the echo's split.
+
+### The fix (`core-term/src/predict.rs`)
+
+- **Judge at the next keystroke, not per read.** The predictor remembers where
+  the cursor rests (from the confirmation that emptied the queue, or observed
+  when nothing is predicted) and the glyph beside it. A key that finds the
+  cursor elsewhere, or a different glyph beside it, starts a new epoch.
+- **A key typed mid-redraw.** If the resting point came from a confirmed echo
+  and the cursor is on the same row, the key is predicted where the shell will
+  wait (not mid-redraw), held, and shown the moment the cursor returns there.
+  If it never returns, it is never shown.
+- **Closed an old hole in the password guard.** A prompt written over the
+  line (`\rPassword: `) can leave the cursor in the very column the echo did;
+  the old rule saw "cursor did not move" and kept drawing. The glyph check
+  catches it. Test: `a_prompt_that_lands_on_the_same_column_still_hides_what_follows`.
+
+Five new tests, all written failing first. The first version of the mid-redraw
+rule regressed bash in the live harness (100% → 88.9%, 39 flushes: it
+predicted from a resting point observed mid-output after Enter); restricted to
+rests set by an echo on the same row, it is back to the baseline.
+
+### Measured
+
+| 200 ms RTT, real zsh with plugins | p50 | p90 | p99 | unpredicted |
+|---|---|---|---|---|
+| before | 4.77 ms | 218 ms | 476 ms | 32% |
+| **after** | **3.57 ms** | **7.12 ms** | 17.5 ms | **0 / 244** |
+
+Live harness, twice, before and after: bash 73 confirmed / 0 missed / 0
+flushes, zsh -f and your zsh 100%, **0 of 9 password characters ever
+visible**. p99 is the X server tail from Phase 20, not the link.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1349,12 +2271,12 @@ Ordered by what it costs to not have.
 
 | # | Item | Spec | Why it is not done |
 |---|---|---|---|
-| 1.1 | **wgpu renderer.** `crates/render` is a 21-line stub; the terminal draws to a 2D canvas. | §2, §7, Step 8 | D-19. Glyphs are rasterised by the browser on the UI thread, which is the exact coupling §3 forbids. **This is why the §4 rows for keystroke latency and the 200 MB `cat` cannot be claimed at all.** The engine behind it measures 47 MiB/s; the ceiling is the canvas. |
-| 1.2 | **Splits are one canvas per pane**, not one surface with scissor rects. | Step 9 | Falls out of 1.1. Nothing above `PaneTree` changes when the renderer lands. |
+| 1.1 | ~~wgpu renderer.~~ **Done in Phase 20** on Linux/X11 (native child window per pane, damage-only presentation). Wayland, Windows and macOS still use the canvas. The 200 MB `cat` row is not yet re-measured on the GPU path. | §2, §7, Step 8 | — |
+| 1.2 | **Splits are one surface per pane** (a native child window each), not one surface with scissor rects. | Step 9 | Works, and each pane presents only its own damage; one shared surface would save a swapchain per pane, nothing measured says it matters. |
 | 1.3 | **Benchmarks need re-measuring.** `parse_and_grid` gave 20.5 / 10.0 / 15.1 / 18.2 MiB/s across four runs of *identical code* — up to 2× variance. | §4, §14 | The machine is not quiet. The earlier 47 MiB/s figure and the later 10–18 range cannot be reconciled from here, and neither is reported as fact. `parse_only` was stable throughout. |
 | 1.4 | **No PGO or BOLT.** | §14.4 | Needs CI, which does not exist. |
 | 1.5 | **No `vttest`/`esctest` corpus.** The 86 parser tests are hand-written. | §16 | The real conformance vectors are a download that was never authorised. |
-| 1.6 | **Predictive echo is not in the live path.** `Predictor` exists, is tested, and reconciles — against synthetic output only. | §1, §5.5 | It needs to sit between keystroke and PTY write. Its value starts at real RTT, so on a local PTY it would predict nothing useful. §1's 20–40× claim remains **unmeasured**. |
+| 1.6 | ~~Predictive echo: end-to-end pixel timing.~~ **Measured (Phase 21):** keystroke → pixel over a 200 ms RTT, real zsh with plugins: **3.57 ms p50, 7.12 ms p90**, 0 of 244 keys unpredicted. p99 17.5 ms is the X server tail (Phase 20). | §1, §5.5 | — |
 | 1.7 | **Scrollback reflow.** Resize reflows the viewport; history is not re-wrapped. | §5.6 | Needs the lazy 1,000-row chunking §5.6 describes. |
 
 ### 2. Security — known residual gaps
@@ -1364,20 +2286,21 @@ Ordered by what it costs to not have.
 | 2.1 | **Secrets broker is not a separate process.** | §12.3 | D-23. Mitigated, not solved: no command returns a secret, so a webview XSS cannot exfiltrate one — but it can still list names, overwrite them, and connect as the user, and nothing contains a compromise of the native side. |
 | 2.2 | **No `mlock`/`VirtualLock`.** Memory is zeroized but not page-locked. | §12.3 | A derived key can reach the page file. Needs platform bindings `core-store` does not have. |
 | 2.3 | **No OS-keychain convenience wrap.** | §12.3 | D-22. Deliberate. The master password is typed every unlock (15-min idle timeout). Adding the wrap later is additive; an unopenable vault has no recovery, so this is the safe direction to be incomplete in. |
-| 2.4 | **No SSH agent auth, no keyboard-interactive/MFA.** | — | Not started. Agent auth in particular is what most people actually use. |
+| 2.4 | **No keyboard-interactive/MFA.** Agent auth is done (Phase 18). | — | Not started. |
 | 2.5 | **No jump hosts.** `Host::jump_host` is in the model and always `None`. | — | Nothing reads it. |
 
 ### 3. Features with no surface yet
 
 | # | Item | Spec |
 |---|---|---|
-| 3.1 | **Module surfaces: Docker, Kubernetes, Databases, REST, Log viewer.** The module rail routes to placeholders. | Steps 12–13 |
-| 3.2 | **`DataTable`** — the shared virtualised table those modules are built on. | Step 12 |
-| 3.3 | **Transfer queue.** AIMD pipelining and the tar-pipe path. Directory transfers are **disabled, not silently broken**; single-file transfer works. | §6.1, §6.2 |
+| 3.1 | **Module surfaces: REST client, Log viewer.** Docker, Kubernetes and Databases are built (Phase 15). | Steps 12–13 |
+| 3.2 | **Database TLS** (D-30), CSV export, schema browser/autocomplete. Connections are plaintext; the panel warns for remote hosts. | §11 |
+| 3.11 | **Kubernetes protobuf** (D-29) and further kinds, events, port-forward. | §10 |
+| 3.3 | **Transfer resume and sync** (§6.5: resumable offsets with prefix hash, Merkle compare, delta). The queue, pipelining, striping, tar-pipe and directory transfers are done (Phase 19). | §6.5 |
 | 3.4 | **LinkStrip** — the 2px per-tab RTT sparkline. **Blocked, not merely undone:** russh exposes no way to time a round trip, and drawing it from the connect time would be decoration pretending to be telemetry. | §0.4 |
 | 3.5 | **Cipher/kex readout** shows `n/a`. russh 0.62's `kex_done` takes a `negotiation::Names` that is private, so the override does not compile. | §0.5 |
 | 3.6 | **`rkyv` index cache.** Config is reparsed every launch. Irrelevant at current host counts; §12.4 is about 10,000. | §12.4 |
-| 3.7 | **Hot reload.** Editing `production.toml` in Vim should make hosts appear. §12.2 calls this "a real differentiator and it costs almost nothing" — it needs a `notify` watcher. | §12.2 |
+| 3.7 | ~~Hot reload~~ — built (`core-store/src/watch.rs`, polled by generation counter); this row was stale. | §12.2 |
 | 3.8 | **Mouse reporting** (`?1000`/`?1002`/`?1006`). Selection and clipboard are done (Phase 14). Without reporting, clicks in htop/mc/vim `mouse=a` select text instead of reaching the program. | — |
 | 3.9 | **Selection is viewport-anchored.** It clears on scroll or resize rather than following the text into scrollback, and soft-wrapped lines copy as separate lines. | — |
 | 3.10 | **No IME input.** Composition is ignored correctly, but committed CJK text has no path to the PTY: the terminal is a canvas, not an input element. | — |
@@ -1391,12 +2314,9 @@ Ordered by what it costs to not have.
 
 ### 5. Environment — blocked on downloads never authorised
 
-1. **Mono fonts have no box-drawing glyphs.** `@fontsource` ships only
-   Google-Fonts-derived subsets; none covers U+2500–259F.
-   `scripts/vendor-fonts.mjs` warns per face. **Consequence: `systemd` and `tree`
-   output renders as tofu.** The fix is the `pyftsubset` command already in
-   `src/styles/fonts.css`, needing `pip install fonttools brotli` plus the full
-   IBM Plex and JetBrains Mono TTFs.
+1. ~~**Mono fonts have no box-drawing glyphs.**~~ Fixed in Phase 20: JetBrains
+   Mono comes from the upstream TTF, subset with fontTools. The same phase
+   found the bigger problem, that every face lacked a–z.
 2. **Playwright Chromium is not installed**, so `tests/visual/visual-check.spec.ts`
    has **never executed** — including the `document.fonts.check()` assertion that
    would catch item 1. ~120 MB.

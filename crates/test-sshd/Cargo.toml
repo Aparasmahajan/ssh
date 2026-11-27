@@ -1,0 +1,12 @@
+[package]
+name = "opspilot-test-sshd"
+description = "Test-only: a throwaway OpenSSH server and a latency-injecting proxy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Dev-dependency of other crates only; never part of the app binary.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }

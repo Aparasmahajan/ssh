@@ -10,30 +10,42 @@
    dashboard on every launch. Blocking briefly is the better trade for a
    locally-loaded font that resolves in a few ms.
 
-   SUBSETTING — the mono faces MUST retain box-drawing glyphs or the terminal
-   renders systemd trees and `tree` output as tofu:
-     Latin + Latin-1 + General Punctuation
-     U+2500–U+257F  Box Drawing        (├ └ ─ │ ┌ ┐ ┘ ┤ ┬ ┴ ┼)
-     U+2580–U+259F  Block Elements     (█ ▄ ▀ ░ ▒ ▓ — cursor, meters, sparkbars)
-     U+25A0–U+25FF  Geometric Shapes   (● ○ ◆ ▶ — status dots)
-     U+2190–U+21FF  Arrows             (↑ ↓ ← → ⇄ ⇅ — transfer direction)
-
-   Generate with fonttools:
-     pyftsubset IBMPlexMono-Regular.ttf \
-       --unicodes="U+0000-00FF,U+2000-206F,U+2190-21FF,U+2500-259F,U+25A0-25FF" \
-       --flavor=woff2 --output-file=ibm-plex-mono-400.woff2
+   WHERE THE BYTES COME FROM
+     IBM Plex: scripts/vendor-fonts.mjs copies fontsource's `latin` and
+       `latin-ext` slices on postinstall. Each face is declared twice below
+       with fontsource's own unicode-ranges. `latin-ext` alone has NO a-z:
+       until 2026-11-26 that was all this file loaded, and the whole UI
+       silently rendered in the system fallback face.
+     JetBrains Mono: crates/render/fonts/, the files the GPU terminal renderer
+       embeds, so both terminal paths draw the same face. These keep the box
+       drawing (U+2500-259F) that no fontsource slice has; without it `tree`
+       and systemd output render as tofu.
    ========================================================================== */
 
 /* ---- IBM Plex Sans — UI ------------------------------------------------- */
 @font-face {
   font-family: "IBM Plex Sans";
-  src: url("./fonts/ibm-plex-sans-400.woff2") format("woff2");
+  src: url("./fonts/ibm-plex-sans-400-latin.woff2") format("woff2");
   font-weight: 400; font-style: normal; font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
   font-family: "IBM Plex Sans";
-  src: url("./fonts/ibm-plex-sans-500.woff2") format("woff2");
+  src: url("./fonts/ibm-plex-sans-400-latin-ext.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-500-latin.woff2") format("woff2");
   font-weight: 500; font-style: normal; font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-500-latin-ext.woff2") format("woff2");
+  font-weight: 500; font-style: normal; font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
 /* ---- IBM Plex Sans Condensed — eyebrows, module titles ------------------
@@ -42,32 +54,63 @@
    almost right and tracks wrong. */
 @font-face {
   font-family: "IBM Plex Sans Condensed";
-  src: url("./fonts/ibm-plex-sans-condensed-600.woff2") format("woff2");
+  src: url("./fonts/ibm-plex-sans-condensed-600-latin.woff2") format("woff2");
   font-weight: 600; font-style: normal; font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "IBM Plex Sans Condensed";
+  src: url("./fonts/ibm-plex-sans-condensed-600-latin-ext.woff2") format("woff2");
+  font-weight: 600; font-style: normal; font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
 /* ---- IBM Plex Mono — all numerics, identifiers, port chips -------------- */
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("./fonts/ibm-plex-mono-400.woff2") format("woff2");
+  src: url("./fonts/ibm-plex-mono-400-latin.woff2") format("woff2");
   font-weight: 400; font-style: normal; font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("./fonts/ibm-plex-mono-500.woff2") format("woff2");
+  src: url("./fonts/ibm-plex-mono-400-latin-ext.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./fonts/ibm-plex-mono-500-latin.woff2") format("woff2");
   font-weight: 500; font-style: normal; font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./fonts/ibm-plex-mono-500-latin-ext.woff2") format("woff2");
+  font-weight: 500; font-style: normal; font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
 /* ---- JetBrains Mono — terminal buffer ONLY -----------------------------
-   JetBrains Mono has no SemiBold; Medium (500) and Bold (700) only.
-   Ligatures are disabled at the usage site (.term in tokens.css), not here. */
+   The NL ("no ligatures") cut: a shell must show `!=`, not `≠`. Italics are
+   real faces, not synthesised slants. */
 @font-face {
   font-family: "JetBrains Mono";
-  src: url("./fonts/jetbrains-mono-400.woff2") format("woff2");
+  src: url("../../crates/render/fonts/JetBrainsMonoNL-Regular.ttf") format("truetype");
   font-weight: 400; font-style: normal; font-display: block;
 }
 @font-face {
   font-family: "JetBrains Mono";
-  src: url("./fonts/jetbrains-mono-700.woff2") format("woff2");
+  src: url("../../crates/render/fonts/JetBrainsMonoNL-Bold.ttf") format("truetype");
   font-weight: 700; font-style: normal; font-display: block;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../../crates/render/fonts/JetBrainsMonoNL-Italic.ttf") format("truetype");
+  font-weight: 400; font-style: italic; font-display: block;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../../crates/render/fonts/JetBrainsMonoNL-BoldItalic.ttf") format("truetype");
+  font-weight: 700; font-style: italic; font-display: block;
 }

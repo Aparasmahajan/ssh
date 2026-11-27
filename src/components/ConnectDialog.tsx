@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { sshConnect, type ConnectionInfo, type HostKeyPolicy } from "@/lib/remote";
+import {
+  sshAgentStatus,
+  sshConnect,
+  type AgentInfo,
+  type ConnectionInfo,
+  type HostKeyPolicy,
+} from "@/lib/remote";
 import type { StoredHost } from "@/lib/workspace";
 import {
   isVaultRef,
@@ -53,6 +59,9 @@ export function ConnectDialog({
   const [openSftp, setOpenSftp] = useState(defaultSftp ?? false);
   const [passphrase, setPassphrase] = useState("");
   const [policy, setPolicy] = useState<HostKeyPolicy>("accept-new");
+  // On unless the saved identity says otherwise, as with `ssh`.
+  const [useAgent, setUseAgent] = useState(first?.use_agent ?? true);
+  const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -89,6 +98,17 @@ export function ConnectDialog({
         // Having no vault is a normal state, not an error worth showing here.
       }
     })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // What the agent holds, so "use SSH agent" says whether it can do anything.
+  useEffect(() => {
+    let live = true;
+    sshAgentStatus()
+      .then((a) => live && setAgent(a))
+      .catch(() => live && setAgent(null));
     return () => {
       live = false;
     };
@@ -140,6 +160,7 @@ export function ConnectDialog({
           passphrase: passphraseRef ? "" : passphrase,
           ...(passwordRef ? { passwordRef } : {}),
           ...(passphraseRef ? { passphraseRef } : {}),
+          useAgent,
         },
         hostKeyPolicy: policy,
       });
@@ -157,7 +178,7 @@ export function ConnectDialog({
   }
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
+    <div data-overlay className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
       <form
         onSubmit={submit}
         className="w-[440px] border-hairline border-bezel-500 bg-chassis-800 p-4"
@@ -187,6 +208,22 @@ export function ConnectDialog({
 
           <Label>key file</Label>
           <Input value={keyPath} onChange={setKeyPath} placeholder="~/.ssh/id_ed25519" />
+
+          <Label>agent</Label>
+          <label
+            className="flex items-center gap-2 text-small text-text-mid"
+            title={agent?.keys.join("\n") || agent?.error || undefined}
+          >
+            <input
+              type="checkbox"
+              checked={useAgent}
+              onChange={(e) => setUseAgent(e.target.checked)}
+            />
+            use SSH agent
+            <span className={`num text-micro ${agentReady(agent) ? "text-text-lo" : "text-amber-500"}`}>
+              {agentSummary(agent)}
+            </span>
+          </label>
 
           <Label>passphrase</Label>
           {passphraseRef ? (
@@ -352,6 +389,18 @@ export function ConnectDialog({
       </form>
     </div>
   );
+}
+
+function agentReady(a: AgentInfo | null): boolean {
+  return a !== null && a.available && a.keys.length > 0;
+}
+
+/** One short phrase. The full key list is the row's tooltip. */
+function agentSummary(a: AgentInfo | null): string {
+  if (a === null) return "";
+  if (!a.available) return "· no agent running";
+  if (a.keys.length === 0) return "· agent holds no keys (ssh-add)";
+  return `· ${a.keys.length} key${a.keys.length === 1 ? "" : "s"}`;
 }
 
 function Label({ children }: { children: string }) {

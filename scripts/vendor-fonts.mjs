@@ -6,11 +6,18 @@
  * filenames fonts.css asks for. @fontsource is the source because it is an
  * ordinary npm dependency — no network fetch at build or run time.
  *
- * Subset preference is widest-first. The mono faces MUST retain U+2500–259F or
- * the terminal renders `systemd` trees as tofu, so this script reports whether
- * the subset it picked actually covers box drawing.
+ * Each face is vendored as TWO slices, `latin` and `latin-ext`, declared in
+ * fonts.css with fontsource's own unicode-ranges. Fontsource's `latin-ext` is
+ * NOT a superset of `latin`: it has no a-z. This script used to pick it as the
+ * "wider" subset, and until 2026-11-26 the whole UI rendered in the system
+ * fallback face with no error anywhere.
+ *
+ * JetBrains Mono is not vendored here. fonts.css takes it from
+ * crates/render/fonts/, the same files the GPU terminal renderer embeds, so
+ * both paths draw the same face and both have box drawing (no fontsource
+ * slice covers U+2500).
  */
-import { readdir, readFile, copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -18,66 +25,30 @@ import path from "node:path";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = path.join(ROOT, "src", "styles", "fonts");
 
-/** Widest coverage first. `all` is unsubsetted and is what we want. */
-const SUBSET_PREFERENCE = ["all", "latin-ext", "latin"];
+const SLICES = ["latin", "latin-ext"];
 
-/** dest filename (as declared in fonts.css) -> @fontsource package + weight */
+/** dest basename (fonts.css adds `-<slice>.woff2`) -> @fontsource package + weight */
 const FACES = [
-  ["ibm-plex-sans-400.woff2", "@fontsource/ibm-plex-sans", 400],
-  ["ibm-plex-sans-500.woff2", "@fontsource/ibm-plex-sans", 500],
-  ["ibm-plex-sans-condensed-600.woff2", "@fontsource/ibm-plex-sans-condensed", 600],
-  ["ibm-plex-mono-400.woff2", "@fontsource/ibm-plex-mono", 400],
-  ["ibm-plex-mono-500.woff2", "@fontsource/ibm-plex-mono", 500],
-  ["jetbrains-mono-400.woff2", "@fontsource/jetbrains-mono", 400],
-  ["jetbrains-mono-700.woff2", "@fontsource/jetbrains-mono", 700],
+  ["ibm-plex-sans-400", "@fontsource/ibm-plex-sans", 400],
+  ["ibm-plex-sans-500", "@fontsource/ibm-plex-sans", 500],
+  ["ibm-plex-sans-condensed-600", "@fontsource/ibm-plex-sans-condensed", 600],
+  ["ibm-plex-mono-400", "@fontsource/ibm-plex-mono", 400],
+  ["ibm-plex-mono-500", "@fontsource/ibm-plex-mono", 500],
 ];
-
-/** Does this package's stylesheet for `subset` declare coverage of U+2500? */
-async function coversBoxDrawing(pkgDir, subset) {
-  const css = path.join(pkgDir, `${subset}.css`);
-  if (!existsSync(css)) return null; // no per-subset css shipped; unknown
-  const text = await readFile(css, "utf8");
-  const ranges = [...text.matchAll(/U\+([0-9A-Fa-f]+)(?:-([0-9A-Fa-f]+))?/g)];
-  return ranges.some(([, lo, hi]) => {
-    const a = parseInt(lo, 16);
-    const b = hi ? parseInt(hi, 16) : a;
-    return a <= 0x2500 && 0x2500 <= b;
-  });
-}
-
-async function pick(pkg, weight) {
-  const pkgDir = path.join(ROOT, "node_modules", ...pkg.split("/"));
-  const filesDir = path.join(pkgDir, "files");
-  if (!existsSync(filesDir)) return { error: `${pkg} not installed` };
-
-  const files = await readdir(filesDir);
-  for (const subset of SUBSET_PREFERENCE) {
-    const name = files.find((f) => f.endsWith(`-${subset}-${weight}-normal.woff2`));
-    if (name) {
-      return { src: path.join(filesDir, name), subset, box: await coversBoxDrawing(pkgDir, subset) };
-    }
-  }
-  return { error: `no woff2 for ${pkg} @ ${weight} (looked for ${SUBSET_PREFERENCE.join(", ")})` };
-}
 
 const problems = [];
 await mkdir(OUT, { recursive: true });
 
 for (const [dest, pkg, weight] of FACES) {
-  const found = await pick(pkg, weight);
-  if (found.error) {
-    problems.push(`  ✗ ${dest} — ${found.error}`);
-    continue;
-  }
-  await copyFile(found.src, path.join(OUT, dest));
-  const isMono = dest.includes("mono");
-  const boxNote = !isMono ? "" : found.box === false ? "  ⚠ NO BOX DRAWING (U+2500)" : found.box === true ? "  ✓ box drawing" : "  ? box drawing unknown";
-  console.log(`  ✓ ${dest}  [${found.subset}]${boxNote}`);
-  if (isMono && found.box === false) {
-    problems.push(
-      `  ⚠ ${dest} subset "${found.subset}" omits U+2500–259F. Terminal box drawing will render as tofu. ` +
-        `Fix: subset the full TTF with the pyftsubset command in src/styles/fonts.css.`,
-    );
+  const base = pkg.split("/")[1];
+  for (const slice of SLICES) {
+    const src = path.join(ROOT, "node_modules", ...pkg.split("/"), "files", `${base}-${slice}-${weight}-normal.woff2`);
+    if (!existsSync(src)) {
+      problems.push(`  ✗ ${dest}-${slice}.woff2 — ${path.relative(ROOT, src)} missing`);
+      continue;
+    }
+    await copyFile(src, path.join(OUT, `${dest}-${slice}.woff2`));
+    console.log(`  ✓ ${dest}-${slice}.woff2`);
   }
 }
 
