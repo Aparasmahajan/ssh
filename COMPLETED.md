@@ -2195,6 +2195,67 @@ code was removed.
 
 ---
 
+## Phase 21 — Predictive echo, measured on screen (2026-11-27)
+
+§4's WAN row ("keystroke → glyph, 200 ms RTT, < 8 ms") had only a backend
+number (~80 µs to the snapshot). Now measured end to end on the GPU path.
+
+### The harness
+
+`OPSPILOT_PROBE_RTT_MS=200` in the latency probe starts, in-process, a
+throwaway sshd and private agent (`opspilot-test-sshd`, probe builds only)
+behind a proxy delaying each direction by half the RTT. It opens the session
+as a user does (new-session button, the connect dialog, submit), types into
+the remote shell, and stops the server before quitting. Auth is the private
+agent only; the host key goes to the probe's scratch config dir.
+
+### What it found: a third of keystrokes waited a round trip
+
+First run, the developer's own zsh (Kali's default zshrc): **p50 4.77 ms,
+p90 218 ms, p99 476 ms, 32% of keys unpredicted.** zsh-syntax-highlighting
+and zsh-autosuggestions answer every key with the echo, a rewrite of it, a
+grey suggestion after the cursor, then `ESC[nD` back. The network split that
+echo across reads, and the move back, arriving alone with nothing predicted,
+hit the rule "output moved the cursor unprompted → new epoch" (it is how a
+password prompt printed without an Enter stays hidden). The next key then
+waited for the server.
+
+The live harness (`tests/live_ssh.rs`) had passed with the same zsh: its keys
+are spaced further apart than the echo's split.
+
+### The fix (`core-term/src/predict.rs`)
+
+- **Judge at the next keystroke, not per read.** The predictor remembers where
+  the cursor rests (from the confirmation that emptied the queue, or observed
+  when nothing is predicted) and the glyph beside it. A key that finds the
+  cursor elsewhere, or a different glyph beside it, starts a new epoch.
+- **A key typed mid-redraw.** If the resting point came from a confirmed echo
+  and the cursor is on the same row, the key is predicted where the shell will
+  wait (not mid-redraw), held, and shown the moment the cursor returns there.
+  If it never returns, it is never shown.
+- **Closed an old hole in the password guard.** A prompt written over the
+  line (`\rPassword: `) can leave the cursor in the very column the echo did;
+  the old rule saw "cursor did not move" and kept drawing. The glyph check
+  catches it. Test: `a_prompt_that_lands_on_the_same_column_still_hides_what_follows`.
+
+Five new tests, all written failing first. The first version of the mid-redraw
+rule regressed bash in the live harness (100% → 88.9%, 39 flushes: it
+predicted from a resting point observed mid-output after Enter); restricted to
+rests set by an echo on the same row, it is back to the baseline.
+
+### Measured
+
+| 200 ms RTT, real zsh with plugins | p50 | p90 | p99 | unpredicted |
+|---|---|---|---|---|
+| before | 4.77 ms | 218 ms | 476 ms | 32% |
+| **after** | **3.57 ms** | **7.12 ms** | 17.5 ms | **0 / 244** |
+
+Live harness, twice, before and after: bash 73 confirmed / 0 missed / 0
+flushes, zsh -f and your zsh 100%, **0 of 9 password characters ever
+visible**. p99 is the X server tail from Phase 20, not the link.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -2210,12 +2271,12 @@ Ordered by what it costs to not have.
 
 | # | Item | Spec | Why it is not done |
 |---|---|---|---|
-| 1.1 | **wgpu renderer.** `crates/render` is a 21-line stub; the terminal draws to a 2D canvas. | §2, §7, Step 8 | D-19. Glyphs are rasterised by the browser on the UI thread, which is the exact coupling §3 forbids. **This is why the §4 rows for keystroke latency and the 200 MB `cat` cannot be claimed at all.** The engine behind it measures 47 MiB/s; the ceiling is the canvas. |
-| 1.2 | **Splits are one canvas per pane**, not one surface with scissor rects. | Step 9 | Falls out of 1.1. Nothing above `PaneTree` changes when the renderer lands. |
+| 1.1 | ~~wgpu renderer.~~ **Done in Phase 20** on Linux/X11 (native child window per pane, damage-only presentation). Wayland, Windows and macOS still use the canvas. The 200 MB `cat` row is not yet re-measured on the GPU path. | §2, §7, Step 8 | — |
+| 1.2 | **Splits are one surface per pane** (a native child window each), not one surface with scissor rects. | Step 9 | Works, and each pane presents only its own damage; one shared surface would save a swapchain per pane, nothing measured says it matters. |
 | 1.3 | **Benchmarks need re-measuring.** `parse_and_grid` gave 20.5 / 10.0 / 15.1 / 18.2 MiB/s across four runs of *identical code* — up to 2× variance. | §4, §14 | The machine is not quiet. The earlier 47 MiB/s figure and the later 10–18 range cannot be reconciled from here, and neither is reported as fact. `parse_only` was stable throughout. |
 | 1.4 | **No PGO or BOLT.** | §14.4 | Needs CI, which does not exist. |
 | 1.5 | **No `vttest`/`esctest` corpus.** The 86 parser tests are hand-written. | §16 | The real conformance vectors are a download that was never authorised. |
-| 1.6 | **Predictive echo: end-to-end pixel timing.** Wired and measured live over 200 ms RTT (Phase 18): backend P50 ~80 µs, 100% hit rate, no password characters drawn. The webview's IPC + paint share of §4's < 8 ms is not measured. | §1, §5.5 | Needs the renderer work in 1.1 or a webview-side probe. |
+| 1.6 | ~~Predictive echo: end-to-end pixel timing.~~ **Measured (Phase 21):** keystroke → pixel over a 200 ms RTT, real zsh with plugins: **3.57 ms p50, 7.12 ms p90**, 0 of 244 keys unpredicted. p99 17.5 ms is the X server tail (Phase 20). | §1, §5.5 | — |
 | 1.7 | **Scrollback reflow.** Resize reflows the viewport; history is not re-wrapped. | §5.6 | Needs the lazy 1,000-row chunking §5.6 describes. |
 
 ### 2. Security — known residual gaps

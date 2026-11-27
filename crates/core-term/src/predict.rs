@@ -166,12 +166,41 @@ pub struct Context {
     pub bracketed_paste: bool,
 }
 
+/// Where the server's cursor rests between keystrokes, and what is beside it.
+#[derive(Clone, Copy, Debug)]
+struct Rest {
+    cursor: Cursor,
+    /// The glyph left of the cursor, if it is not in column 0.
+    left: Option<u32>,
+    /// Set by a confirmed echo (we were typing on this line), not observed
+    /// after output. Only then can a cursor seen elsewhere on the same row be
+    /// the shell's redraw in progress; after Enter, a first read of output is
+    /// no place to predict from.
+    from_echo: bool,
+}
+
+impl Rest {
+    fn at(screen: &Screen, cursor: Cursor) -> Rest {
+        let left = (cursor.col > 0).then(|| screen.grid().cell(cursor.row, cursor.col - 1).0);
+        Rest { cursor, left, from_echo: false }
+    }
+
+    /// The screen still shows the shell waiting here. Both checks matter: a
+    /// prompt written over the line can leave the cursor in the very column
+    /// the echo did, but not with the echoed character beside it.
+    fn holds(&self, screen: &Screen) -> bool {
+        let now = Rest::at(screen, screen.grid().cursor);
+        (now.cursor.row, now.cursor.col) == (self.cursor.row, self.cursor.col) && now.left == self.left
+    }
+}
+
 /// Predicted edits over the authoritative grid, with Mosh's epoch rule.
 ///
 /// **Epochs.** Anything that can change what the server does with input
 /// starts a new epoch: Enter or any other key that is not predicted, a paste,
-/// a mismatch or timeout, a resize, or output that moved the cursor while
-/// nothing was predicted (a program printing a prompt). Predictions in an epoch
+/// a mismatch or timeout, a resize, or output that left the cursor somewhere
+/// else while nothing was predicted (a program printing a prompt; judged at
+/// the next keystroke, so a shell's own redraw that comes back is not one). Predictions in an epoch
 /// are tentative: tracked and reconciled, but **not drawn**, until the server
 /// echoes the first of them. Then the epoch is confirmed and the rest of it is
 /// drawn instantly.
@@ -194,9 +223,16 @@ pub struct Predictor {
     /// The latest epoch the server has confirmed by echoing a prediction made
     /// in it. Predictions are drawn only while this equals `epoch`.
     confirmed_epoch: Option<u64>,
-    /// The server's cursor after the last reconcile, to notice output that
-    /// moved it with nothing predicted.
-    last_cursor: Option<Cursor>,
+    /// Where the server's cursor rests while nothing is predicted, and the
+    /// glyph just left of it: set by the confirmation that emptied the queue,
+    /// or from the screen when nothing was predicted. The next keystroke
+    /// compares against it (see [`Predictor::on_input`]).
+    rest: Option<Rest>,
+    /// The resting point a keystroke found the cursor away from. Its epoch
+    /// is tentative, but if the cursor comes back there before anything else
+    /// happens, the output was the shell's own redraw (the key arrived in the
+    /// middle of it) and the epoch is trusted again without a round trip.
+    suspect: Option<Rest>,
     /// Set when the server appears to have echo disabled (password prompt).
     /// Cleared as soon as an echo is confirmed again.
     echo_off: bool,
@@ -211,7 +247,8 @@ impl Predictor {
             config,
             epoch: 0,
             confirmed_epoch: None,
-            last_cursor: None,
+            rest: None,
+            suspect: None,
             echo_off: false,
             silent_timeouts: 0,
         }
@@ -264,6 +301,7 @@ impl Predictor {
     /// echoes some of it.
     fn new_epoch(&mut self) {
         self.epoch += 1;
+        self.suspect = None;
     }
 
     /// Input reached the server without passing through [`on_input`] — a
@@ -317,6 +355,22 @@ impl Predictor {
         if bytes.is_empty() {
             return 0;
         }
+        // Output since the queue emptied that left the cursor somewhere else,
+        // or changed the character beside it, was a program printing
+        // something: perhaps a password prompt. Judged here, at the next
+        // keystroke, not per read: a shell's own redraw (syntax highlighting,
+        // autosuggestions, a clock in RPROMPT) wanders and comes back, and the
+        // network can split it across reads anywhere.
+        if self.queue.is_empty() {
+            if let Some(r) = self.rest.take() {
+                if !r.holds(screen) {
+                    self.new_epoch();
+                    if r.from_echo && screen.grid().cursor.row == r.cursor.row {
+                        self.suspect = Some(r);
+                    }
+                }
+            }
+        }
         if !self.may_predict(screen, ctx) {
             // Whatever these bytes do, it was not predicted: assume it changed
             // how the server treats what comes next.
@@ -325,8 +379,13 @@ impl Predictor {
         }
 
         let mut made = 0;
-        // Cursor position to predict from: the last prediction's, or the grid's.
-        let mut cursor = self.tail_cursor().unwrap_or(screen.grid().cursor);
+        // Cursor position to predict from: the last prediction's; else where
+        // the shell will be waiting if a redraw is still settling; else the
+        // grid's.
+        let mut cursor = self
+            .tail_cursor()
+            .or(self.suspect.map(|r| r.cursor))
+            .unwrap_or(screen.grid().cursor);
 
         let mut i = 0;
         while i < bytes.len() {
@@ -491,16 +550,27 @@ impl Predictor {
     /// gone quiet (the app does, from its frame poll).
     pub fn reconcile(&mut self, screen: &Screen, now_ms: u64) {
         let cursor = screen.grid().cursor;
+        // The cursor is back where the shell waits, with the same character
+        // beside it: what moved it was a redraw, and this epoch can be drawn.
+        if let Some(r) = self.suspect {
+            if r.holds(screen) {
+                self.suspect = None;
+                self.confirmed_epoch = Some(self.epoch);
+                let epoch = self.epoch;
+                for q in self.queue.iter_mut().filter(|q| q.epoch == epoch) {
+                    q.shown = true;
+                }
+            }
+        }
         if self.queue.is_empty() {
-            // Output moved the cursor and none of it was an echo of ours: a
-            // program printed something, perhaps a prompt. New epoch.
-            if self.last_cursor.is_some_and(|c| c != cursor) {
-                self.new_epoch();
+            // Nothing predicted: remember where the cursor rests, once. Moves
+            // after this are judged at the next keystroke.
+            if self.rest.is_none() {
+                self.rest = Some(Rest::at(screen, cursor));
             }
         } else {
             self.resolve(screen, cursor, now_ms);
         }
-        self.last_cursor = Some(cursor);
     }
 
     fn resolve(&mut self, screen: &Screen, cursor: Cursor, now_ms: u64) {
@@ -518,7 +588,7 @@ impl Predictor {
             // it.
             if let Some(k) = self.arrived(screen, cursor) {
                 for _ in 0..=k {
-                    self.confirm();
+                    self.confirm(screen);
                 }
                 continue;
             }
@@ -532,7 +602,7 @@ impl Predictor {
                     (cursor.row, cursor.col) >= (p.cursor_after.row, p.cursor_after.col);
                 if server_reached {
                     if glyph == p.glyph {
-                        self.confirm();
+                        self.confirm(screen);
                         continue;
                     }
                     // The server produced something different. §5.5: discard
@@ -599,8 +669,13 @@ impl Predictor {
         None
     }
 
-    fn confirm(&mut self) {
+    fn confirm(&mut self, screen: &Screen) {
         let Some(p) = self.queue.pop_front() else { return };
+        if self.queue.is_empty() {
+            // The shell is now waiting where this echo left it, whatever it
+            // draws around the cursor meanwhile.
+            self.rest = Some(Rest { from_echo: true, ..Rest::at(screen, p.cursor_after) });
+        }
         if p.shown {
             self.stats.confirmed += 1;
         } else {
@@ -609,6 +684,7 @@ impl Predictor {
         self.silent_timeouts = 0;
         // A confirmed echo disproves the echo-off guess.
         self.echo_off = false;
+        self.suspect = None;
         // The server echoed a keystroke from the current epoch: it is
         // echoing, so the rest of this epoch can be drawn. An echo from an
         // OLDER epoch proves nothing about this one — the classic case is a
@@ -637,6 +713,7 @@ impl Predictor {
         }
         self.queue.clear();
         self.stats.flushes += 1;
+        self.rest = None;
         self.new_epoch();
         self.evaluate_hit_rate();
     }
@@ -661,7 +738,7 @@ impl Predictor {
     pub fn reset(&mut self) {
         self.queue.clear();
         self.silent_timeouts = 0;
-        self.last_cursor = None;
+        self.rest = None;
         self.new_epoch();
     }
 }
@@ -771,6 +848,113 @@ mod tests {
         pred.reconcile(&screen, 1);
         pred.on_input(&screen, &Context::default(), b"x", 2);
         assert_eq!(pred.overlay().count(), 1);
+    }
+
+    /// zsh-syntax-highlighting and zsh-autosuggestions answer every key with
+    /// the echo, a rewrite of it, a grey suggestion after the cursor, then a
+    /// move back to the insertion point. The network splits that wherever it
+    /// likes; the move back arriving in a read of its own is not a new prompt.
+    /// Before this held, a third of keystrokes over a 200 ms link waited a
+    /// round trip (the app's latency probe, with Kali's default zshrc).
+    #[test]
+    fn a_redraw_split_across_reads_keeps_the_epoch() {
+        let (mut screen, mut parser, mut pred) = setup();
+        feed(&mut screen, &mut parser, b"$ ");
+        pred.reconcile(&screen, 0);
+        assert_eq!(pred.on_input(&screen, &Context::default(), b"x", 1), 1);
+        // The echo, its highlighted rewrite, and the suggestion.
+        feed(&mut screen, &mut parser, b"x\x08\x1b[4mx\x1b[24m\x1b[38;5;244margs -n1\x1b[39m");
+        pred.reconcile(&screen, 2);
+        // A later read: back to the insertion point.
+        feed(&mut screen, &mut parser, b"\x1b[8D");
+        pred.reconcile(&screen, 3);
+        pred.on_input(&screen, &Context::default(), b"y", 4);
+        assert!(
+            pred.overlay().any(|o| o.glyph == b'y' as u32),
+            "the next key waited for the server after a split redraw"
+        );
+    }
+
+    /// The next key can arrive between the two halves of that redraw: after
+    /// the echo confirmed, before the move back. It must be predicted where the
+    /// shell will be waiting (not where the cursor happens to be mid-redraw),
+    /// held back, and shown as soon as the move back lands.
+    #[test]
+    fn a_key_typed_mid_redraw_is_shown_when_the_redraw_settles() {
+        let (mut screen, mut parser, mut pred) = setup();
+        feed(&mut screen, &mut parser, b"$ ");
+        pred.reconcile(&screen, 0);
+        pred.on_input(&screen, &Context::default(), b"x", 1);
+        feed(&mut screen, &mut parser, b"x\x08\x1b[4mx\x1b[24m\x1b[38;5;244margs -n1\x1b[39m");
+        pred.reconcile(&screen, 2);
+        // 'y' arrives with the cursor still out at the end of the suggestion.
+        assert_eq!(pred.on_input(&screen, &Context::default(), b"y", 3), 1);
+        assert!(pred.overlay().next().is_none(), "drawn before the shell was back where it waits");
+        feed(&mut screen, &mut parser, b"\x1b[8D");
+        pred.reconcile(&screen, 4);
+        let shown: Vec<_> = pred.overlay().collect();
+        assert_eq!(shown.len(), 1, "not shown once the redraw settled");
+        assert_eq!((shown[0].glyph, shown[0].col), (b'y' as u32, 3), "predicted at the wrong column");
+        // And the server's echo of it confirms it normally.
+        feed(&mut screen, &mut parser, b"y\x1b[38;5;244mes\x1b[39m\x1b[2D");
+        pred.reconcile(&screen, 5);
+        assert_eq!(pred.outstanding(), 0);
+        assert_eq!(pred.stats().flushes, 0);
+    }
+
+    /// The same interleaving where the output was a prompt, not a redraw: the
+    /// cursor never comes back, so the held key is never shown.
+    #[test]
+    fn a_key_typed_while_a_prompt_prints_stays_hidden() {
+        let (mut screen, mut parser, mut pred) = setup();
+        feed(&mut screen, &mut parser, b"continue? ");
+        pred.reconcile(&screen, 0);
+        pred.on_input(&screen, &Context::default(), b"y", 1);
+        feed(&mut screen, &mut parser, b"y\r\nPassword: ");
+        pred.reconcile(&screen, 2);
+        pred.on_input(&screen, &Context::default(), b"s", 3);
+        pred.reconcile(&screen, 4);
+        pred.on_input(&screen, &Context::default(), b"e", 5);
+        pred.reconcile(&screen, 6);
+        assert!(pred.overlay().next().is_none(), "a character typed at a password prompt was drawn");
+    }
+
+    /// The guard the previous test must not weaken: output that leaves the
+    /// cursor somewhere new after a confirmed echo, in however many reads, is
+    /// a program printing something (`read -n1`, then a password prompt).
+    #[test]
+    fn a_prompt_printed_after_a_confirmed_echo_hides_what_follows() {
+        let (mut screen, mut parser, mut pred) = setup();
+        feed(&mut screen, &mut parser, b"continue? ");
+        pred.reconcile(&screen, 0);
+        pred.on_input(&screen, &Context::default(), b"y", 1);
+        feed(&mut screen, &mut parser, b"y");
+        pred.reconcile(&screen, 2);
+        feed(&mut screen, &mut parser, b"\r\nPass");
+        pred.reconcile(&screen, 3);
+        feed(&mut screen, &mut parser, b"word: ");
+        pred.reconcile(&screen, 4);
+        pred.on_input(&screen, &Context::default(), b"s", 5);
+        assert!(pred.overlay().next().is_none(), "a character typed at a password prompt was drawn");
+    }
+
+    /// Same, with the prompt overwriting the echoed line so the cursor lands
+    /// exactly where the echo left it. The echoed character is gone, so this
+    /// is still not the shell's own redraw.
+    #[test]
+    fn a_prompt_that_lands_on_the_same_column_still_hides_what_follows() {
+        let (mut screen, mut parser, mut pred) = setup();
+        feed(&mut screen, &mut parser, b"continue?");
+        pred.reconcile(&screen, 0);
+        pred.on_input(&screen, &Context::default(), b"y", 1);
+        feed(&mut screen, &mut parser, b"y");
+        pred.reconcile(&screen, 2);
+        // "continue?y" leaves the cursor at col 10; so does "\rPassword: ".
+        feed(&mut screen, &mut parser, b"\rPassword: ");
+        pred.reconcile(&screen, 3);
+        assert_eq!(screen.grid().cursor.col, 10);
+        pred.on_input(&screen, &Context::default(), b"s", 4);
+        assert!(pred.overlay().next().is_none(), "a character typed at a password prompt was drawn");
     }
 
     /// An echo from before Enter must not vouch for what is typed after it.

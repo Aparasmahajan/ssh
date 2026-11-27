@@ -118,11 +118,20 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
     }) {
         win.set_size(tauri::LogicalSize::new(w, h)).map_err(|e| e.to_string())?;
     }
-    // Open a local shell the way a user would.
-    win.eval(
-        "[...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Local shell')?.click()",
-    )
-    .map_err(|e| e.to_string())?;
+    // `OPSPILOT_PROBE_RTT_MS=200`: type into an SSH session over a link with
+    // that round trip (§4's WAN row, where predictive echo has to carry it).
+    let rtt = std::env::var("OPSPILOT_PROBE_RTT_MS").ok().and_then(|v| v.parse::<u64>().ok());
+    let link = match rtt {
+        Some(ms) => Some(open_remote(&win, ms)?),
+        None => {
+            // Open a local shell the way a user would.
+            win.eval(
+                "[...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Local shell')?.click()",
+            )
+            .map_err(|e| e.to_string())?;
+            None
+        }
+    };
     std::thread::sleep(Duration::from_secs(4));
     win.eval("document.querySelector('[aria-label=Terminal]')?.focus()").map_err(|e| e.to_string())?;
     std::thread::sleep(Duration::from_secs(1));
@@ -134,6 +143,10 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
     let mode = match (gpu.is_some(), present_mode(), gpu_wait()) {
         (false, ..) => "canvas".to_string(),
         (true, m, w) => format!("gpu{}{}", m.map(|m| format!(" {m:?}")).unwrap_or_default(), if w { " +wait" } else { "" }),
+    };
+    let mode = match rtt {
+        Some(ms) => format!("{mode} ssh {ms}ms rtt"),
+        None => mode,
     };
     let (conn, _) = x11rb::connect(None).map_err(|e| e.to_string())?;
     let (px, py) = find_cursor(&conn, target)?;
@@ -284,6 +297,8 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
             eprintln!("[latency:{mode}]   {name:<44} p50 {:.2} ms  p90 {:.2}  p99 {:.2}", q(0.5), q(0.9), q(0.99));
         }
     }
+    // sshd and the agent are children: stop them before the process goes.
+    drop(link);
     // The normal quit path, so a crash on exit shows up here too.
     app.exit(0);
     Ok(())
@@ -372,3 +387,50 @@ fn unix_ms(at: Instant) -> f64 {
     now - at.elapsed().as_secs_f64() * 1000.0
 }
 
+
+/// What keeps the slow link up: the server, its agent, the proxy's runtime.
+struct Link {
+    _sshd: opspilot_test_sshd::Sshd,
+    _rt: tokio::runtime::Runtime,
+}
+
+/// Start a throwaway sshd and agent behind a proxy that adds `rtt_ms` per
+/// round trip, then open a session to it through the UI as a user would: the
+/// new-session button, the connect dialog, submit. Auth is the private agent
+/// alone; the host key is recorded in the probe's own config dir (accept-new),
+/// never in `~/.ssh`.
+fn open_remote(win: &tauri::WebviewWindow, rtt_ms: u64) -> Result<Link, String> {
+    let mut sshd = opspilot_test_sshd::Sshd::start("probe").ok_or("could not start a test sshd")?;
+    let sock = sshd.agent().ok_or("could not start a test ssh-agent")?;
+    // The app reads it at connect time. Only ever the private agent's socket.
+    std::env::set_var("SSH_AUTH_SOCK", &sock);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let port = opspilot_test_sshd::delay_proxy(&rt, sshd.port, Duration::from_millis(rtt_ms / 2));
+    eprintln!("[latency] sshd :{} behind a {rtt_ms} ms proxy on :{port}", sshd.port);
+
+    win.eval("document.querySelector('[aria-label=\"New session\"]')?.click()").map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_secs(1));
+    // React owns these inputs: set through the native setter, then tell React.
+    let fill = format!(
+        r#"(() => {{
+            const set = (el, v) => {{
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }};
+            const form = document.querySelector('form');
+            set(form.querySelector('input[placeholder="10.20.4.11"]'), '127.0.0.1');
+            set(form.querySelector('input[type=number]'), '{port}');
+            set(form.querySelector('input[placeholder="deploy"]'), {user:?});
+            setTimeout(() => form.requestSubmit(), 200);
+        }})()"#,
+        user = sshd.user,
+    );
+    win.eval(&fill).map_err(|e| e.to_string())?;
+    // Handshake and auth take a few round trips.
+    std::thread::sleep(Duration::from_secs(4));
+    Ok(Link { _sshd: sshd, _rt: rt })
+}

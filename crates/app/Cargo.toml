@@ -56,10 +56,13 @@ gdkx11 = "0.18"
 # Test harness only (crate::latency_probe, feature `latency-probe`): reads the
 # window's pixels on a second X connection. Not in a normal build.
 x11rb = { version = "0.14", optional = true }
+# The same harness over a slow SSH link: a throwaway sshd, private agent and
+# delay proxy (`OPSPILOT_PROBE_RTT_MS`). Also a dev-dependency; never shipped.
+opspilot-test-sshd = { path = "../test-sshd", optional = true }
 
 [features]
 # Keystroke → pixel latency harness on the real display. See latency_probe.rs.
-latency-probe = ["dep:x11rb"]
+latency-probe = ["dep:x11rb", "dep:opspilot-test-sshd"]
 
 # poll() on the PTY and killpg() on close (session.rs). Already linked through
 # portable-pty and tokio: no new code in the binary.

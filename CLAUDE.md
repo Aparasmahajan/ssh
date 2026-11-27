@@ -808,6 +808,14 @@ Two more lessons from the same work:
   the last one only on its fourth run. Run it after any predictor change, more
   than once. When writing a regression test from a live failure, reproduce the
   **chunking** too: the queue-cap bug needs the echo and the prompt in one read.
+- **And with a real user's shell.** Kali's zshrc answers each key with a
+  highlighted rewrite, a grey autosuggestion and a cursor move back. Split
+  across reads, the move back looked like a program printing a prompt, and
+  a third of keystrokes over 200 ms waited a round trip; `live_ssh.rs`
+  passed throughout because its keys are spaced wider than the split. The
+  latency probe (`OPSPILOT_PROBE_RTT_MS=200`) types at human pace and caught
+  it. Judge "the cursor moved" at the next keystroke, against where it rested
+  and the glyph beside it, never per read.
 
 ### 18.22 `russh-sftp`'s `FileAttributes::default()` is not "no attributes"
 
