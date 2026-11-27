@@ -22,8 +22,15 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// The machine-local state root — rebuildable, never exported.
+///
+/// On Linux this is `$XDG_STATE_HOME` (`~/.local/state`), which the XDG spec
+/// defines for exactly this: logs, history, window geometry — "data that should
+/// persist between restarts but is not important or portable enough" for
+/// `~/.local/share`. `dirs::state_dir()` is `None` on Windows and macOS, which
+/// fall through to `%LOCALAPPDATA%` and `~/Library/Application Support`.
 pub fn state_dir() -> PathBuf {
-    dirs::data_local_dir()
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
         .unwrap_or_else(config_dir)
         .join("opspilot")
 }
@@ -63,7 +70,25 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    })
+    })?;
+
+    // On Linux the rename itself lives in the *directory*, and until the
+    // directory is fsynced a power cut can roll it back — ext4 and XFS both
+    // document this. The file's data was synced above; this syncs its name.
+    // Best effort: some filesystems (and FUSE mounts) refuse to open a
+    // directory for sync, and the write has already succeeded.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Collapse `$HOME` to `~` for storage.
@@ -73,12 +98,25 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 /// `C:\Users\alice\.ssh\id_ed25519` must be stored as `~/.ssh/id_ed25519` or the
 /// config is worthless on any other machine.
 pub fn portable(path: &str) -> String {
-    let p = path.replace('\\', "/");
+    // Only Windows uses `\` as a separator. On Linux and macOS it is a legal
+    // filename character, and rewriting it would point at a different file.
+    let normalise = |s: &str| {
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.to_string()
+        }
+    };
+    let p = normalise(path);
     if let Some(home) = dirs::home_dir() {
-        let h = home.to_string_lossy().replace('\\', "/");
+        let h = normalise(&home.to_string_lossy());
         let h = h.trim_end_matches('/');
         if let Some(rest) = p.strip_prefix(h) {
-            return format!("~{}", rest);
+            // Component boundary only: with $HOME=/home/al, the path
+            // /home/alice/key must stay absolute, not become `~ice/key`.
+            if rest.is_empty() || rest.starts_with('/') {
+                return format!("~{}", rest);
+            }
         }
     }
     p
@@ -139,6 +177,25 @@ mod tests {
             key.as_path(),
             "round trip must land on the original path"
         );
+    }
+
+    #[test]
+    fn a_sibling_of_home_is_not_collapsed_to_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let h = home.to_string_lossy().replace('\\', "/");
+        let sibling = format!("{}x/.ssh/id_ed25519", h.trim_end_matches('/'));
+        assert!(
+            !portable(&sibling).starts_with('~'),
+            "{sibling} is not under $HOME, got {}",
+            portable(&sibling)
+        );
+        assert_eq!(portable(&h), "~");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backslash_is_a_filename_character_on_unix() {
+        assert_eq!(portable("/srv/odd\\name"), "/srv/odd\\name");
     }
 
     #[test]

@@ -1,20 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { keyToBytes } from "@/lib/keys";
+import { keyToBytes, type KeyModes } from "@/lib/keys";
+import { CHORD, isAppChord } from "@/lib/platform";
 import {
   closeSession,
+  copyText,
   listShells,
   openSession,
+  pasteInto,
   resizeSession,
   scrollSession,
   snapshotSession,
   writeSession,
+  type ClipboardSelection,
   type LineUpdate,
   type ShellInfo,
 } from "@/lib/session";
 import { sshOpenShell, type ConnectionInfo } from "@/lib/remote";
 import { registerPane, sessionsFor, unregisterPane } from "@/lib/broadcast";
 import { leaves, usePanes } from "@/state/panes";
-import { isFontZoomKey, useSettings } from "@/state/settings";
+import { useSettings } from "@/state/settings";
 
 /**
  * The terminal surface.
@@ -44,6 +48,38 @@ import { isFontZoomKey, useSettings } from "@/state/settings";
 const PADDING = 6;
 
 type Cell = { w: number; h: number };
+
+/** A cell in viewport coordinates. */
+type Point = { row: number; col: number };
+/** Anchor and head, in the order the user made them; see `ordered`. */
+type Selection = { a: Point; b: Point };
+
+/** Selection is drawn translucent OVER the text, so the glyphs stay readable. */
+const SELECTION_ALPHA = 0.32;
+
+/** Start and end of a selection in reading order. */
+function ordered(s: Selection): [Point, Point] {
+  const { a, b } = s;
+  return a.row < b.row || (a.row === b.row && a.col <= b.col) ? [a, b] : [b, a];
+}
+
+/**
+ * Characters a double-click keeps inside one word. Deliberately broad — `/`,
+ * `.`, `-`, `:`, `@`, `~`, `=` — so a double-click takes a whole path, URL,
+ * `user@host` or `KEY=value`, which is what one is double-clicked for in a
+ * terminal. Quotes, brackets and shell operators end a word.
+ */
+const WORD_CHAR = /[^\s"'`()[\]{}<>|;&]/;
+
+/** [first, last] column of the word at `col`. O(row length). */
+function wordAt(cells: readonly string[], col: number): [number, number] {
+  if (!WORD_CHAR.test(cells[col] ?? " ")) return [col, col];
+  let lo = col;
+  let hi = col;
+  while (lo > 0 && WORD_CHAR.test(cells[lo - 1] ?? " ")) lo--;
+  while (hi < cells.length - 1 && WORD_CHAR.test(cells[hi + 1] ?? " ")) hi++;
+  return [lo, hi];
+}
 
 /**
  * Resolve `--font-term` to a literal family list.
@@ -94,6 +130,16 @@ export function TerminalSurface({
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  /** Selection layer. Separate so a damaged row repaint never erases the
+   *  highlight, and drawing the highlight never forces a text repaint. */
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const selection = useRef<Selection | null>(null);
+  /** Removes the window listeners of a drag in progress. */
+  const endDrag = useRef<(() => void) | null>(null);
+  const selColor = useRef<string>("");
+  /** Input modes from the latest snapshot — DECCKM changes what arrows send. */
+  const modes = useRef<KeyModes>({ appCursor: false });
+  const cursorVisible = useRef(true);
 
   const sessionId = useRef<number | null>(null);
   const generation = useRef(0);
@@ -181,6 +227,14 @@ export function TerminalSurface({
       const prev = paintedCursor.current;
       const { row, col } = cursor.current;
 
+      // DECTCEM off (vim, htop, less while drawing): erase, draw nothing.
+      if (!cursorVisible.current) {
+        const stale = prev ? lines.current.get(prev.row) : undefined;
+        if (stale) paintRow(ctx, stale);
+        paintedCursor.current = null;
+        return;
+      }
+
       if (prev && (prev.row !== row || prev.col !== col)) {
         const stale = lines.current.get(prev.row);
         if (stale) paintRow(ctx, stale);
@@ -217,6 +271,74 @@ export function TerminalSurface({
     },
     [paintCursor, paintRow],
   );
+
+  /* ---- Selection --------------------------------------------------------- */
+
+  const drawSelection = useCallback(() => {
+    const ov = overlayRef.current;
+    const ctx = ov?.getContext("2d");
+    if (!ov || !ctx) return;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, ov.width, ov.height);
+    ctx.restore();
+
+    const sel = selection.current;
+    if (!sel) return;
+    const [p, q] = ordered(sel);
+    const { w, h } = cellRef.current;
+    const { cols } = gridRef.current;
+    ctx.fillStyle = selColor.current;
+    ctx.globalAlpha = SELECTION_ALPHA;
+    // O(selected rows): one rect per row.
+    for (let r = p.row; r <= q.row; r++) {
+      const c0 = r === p.row ? p.col : 0;
+      const c1 = r === q.row ? q.col : cols - 1;
+      ctx.fillRect(PADDING + c0 * w, PADDING + r * h, (c1 - c0 + 1) * w, h);
+    }
+    ctx.globalAlpha = 1;
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    if (selection.current === null) return;
+    selection.current = null;
+    drawSelection();
+  }, [drawSelection]);
+
+  /** The selected text, one line per row, trailing blanks trimmed. Rows are
+   *  indexed by code point because the Rust side sends one per cell. */
+  const selectedText = useCallback((): string => {
+    const sel = selection.current;
+    if (!sel) return "";
+    const [p, q] = ordered(sel);
+    const { cols } = gridRef.current;
+    const out: string[] = [];
+    for (let r = p.row; r <= q.row; r++) {
+      const cells = Array.from(lines.current.get(r)?.text ?? "");
+      const c0 = r === p.row ? p.col : 0;
+      const c1 = r === q.row ? q.col : cols - 1;
+      out.push(cells.slice(c0, c1 + 1).join("").trimEnd());
+    }
+    return out.join("\n");
+  }, []);
+
+  /** Linux convention: whatever is selected is on PRIMARY, for middle-click. */
+  const publishPrimary = useCallback(() => {
+    const text = selectedText();
+    if (text) copyText(text, "primary").catch((e: unknown) => setError(String(e)));
+  }, [selectedText]);
+
+  const cellAt = useCallback((clientX: number, clientY: number): Point => {
+    const box = wrapRef.current?.getBoundingClientRect();
+    const { w, h } = cellRef.current;
+    const { rows, cols } = gridRef.current;
+    const x = clientX - (box?.left ?? 0) - PADDING;
+    const y = clientY - (box?.top ?? 0) - PADDING;
+    return {
+      row: Math.min(rows - 1, Math.max(0, Math.floor(y / h))),
+      col: Math.min(cols - 1, Math.max(0, Math.floor(x / w))),
+    };
+  }, []);
 
   /* ---- Open the session -------------------------------------------------- */
 
@@ -261,6 +383,7 @@ export function TerminalSurface({
 
       familyRef.current = termFamily();
       cursorColor.current = cssVar("--amber-500");
+      selColor.current = cssVar("--amber-500");
       bgColor.current = cssVar("--chassis-900");
       cellRef.current = measure(ctx);
       const { rows, cols } = fitToBox();
@@ -322,11 +445,16 @@ export function TerminalSurface({
           if (!snap) return; // nothing changed — the common case
           generation.current = snap.generation;
           cursor.current = { row: snap.cursor_row, col: snap.cursor_col };
+          modes.current = { appCursor: snap.app_cursor };
+          cursorVisible.current = snap.cursor_visible;
           gridRef.current = { rows: snap.rows, cols: snap.cols };
           if (!snap.alive) setExited(true);
           setScrolled(snap.scroll_offset);
 
           if (snap.full) {
+            // Scrolled or resized: viewport rows now hold different lines, so a
+            // selection in viewport coordinates would point at the wrong text.
+            clearSelection();
             lines.current.clear();
             for (const l of snap.lines) lines.current.set(l.row, l);
             repaintAll(ctx);
@@ -351,7 +479,7 @@ export function TerminalSurface({
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [paintCursor, paintRow, repaintAll]);
+  }, [clearSelection, paintCursor, paintRow, repaintAll]);
 
   /* ---- Resize ------------------------------------------------------------ */
 
@@ -374,6 +502,16 @@ export function TerminalSurface({
       canvas.style.width = `${box.width}px`;
       canvas.style.height = `${box.height}px`;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const ov = overlayRef.current;
+      const octx = ov?.getContext("2d");
+      if (ov && octx) {
+        ov.width = canvas.width;
+        ov.height = canvas.height;
+        octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      // Cell geometry may have changed under the selection.
+      selection.current = null;
 
       familyRef.current = termFamily();
       cellRef.current = measure(ctx);
@@ -398,6 +536,7 @@ export function TerminalSurface({
     if (!ctx) return;
 
     cellRef.current = measure(ctx);
+    clearSelection();
     const { rows, cols } = fitToBox();
     const id = sessionId.current;
     if (id !== null) {
@@ -407,7 +546,7 @@ export function TerminalSurface({
       void resizeSession(id, rows, cols);
     }
     repaintAll(ctx);
-  }, [fontPx, lineHeight, fitToBox, measure, repaintAll]);
+  }, [fontPx, lineHeight, fitToBox, measure, repaintAll, clearSelection]);
 
   /* ---- Input ------------------------------------------------------------- */
 
@@ -421,46 +560,138 @@ export function TerminalSurface({
     if (delta !== 0) void scrollSession(id, delta);
   }, []);
 
+  /** Where keystrokes and pastes go: this pane, or every pane in the tab while
+   *  broadcasting (Step 9). Never "every open session" — a background tab must
+   *  not be typed into. */
+  const targets = useCallback((): number[] => {
+    const id = sessionId.current;
+    if (id === null) return [];
+    if (broadcast && tabId) {
+      const tree = usePanes.getState().trees[tabId];
+      return tree ? sessionsFor(leaves(tree)) : [id];
+    }
+    return [id];
+  }, [broadcast, tabId]);
+
+  const paste = useCallback(
+    (from: ClipboardSelection) => {
+      clearSelection();
+      pasteInto(targets(), from).catch((e: unknown) => setError(String(e)));
+    },
+    [clearSelection, targets],
+  );
+
   const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     const id = sessionId.current;
     if (id === null) return;
-    // Font zoom first: Ctrl +/-/0 must never reach the shell as input.
-    const zoom = isFontZoomKey(e.nativeEvent);
-    if (zoom) {
-      if (zoom === "in") adjustFont(1);
-      else if (zoom === "out") adjustFont(-1);
-      else resetFont();
+    const ev = e.nativeEvent;
+    const claim = () => {
       e.preventDefault();
       e.stopPropagation();
+    };
+    // Font zoom is not handled here: AppShell claims it in the capture phase
+    // for the whole window. Handling it here too changed the size twice.
+
+    // Copy: Ctrl+Shift+C / ⌘C, and Ctrl+Insert. With nothing selected it does
+    // nothing — in particular it must not fall through and send Ctrl+C.
+    if (isAppChord(ev, CHORD.copy) || (e.ctrlKey && !e.shiftKey && e.key === "Insert")) {
+      const text = selectedText();
+      if (text) copyText(text, "clipboard").catch((err: unknown) => setError(String(err)));
+      claim();
+      return;
+    }
+    // Paste: Ctrl+Shift+V / ⌘V, and Shift+Insert.
+    if (isAppChord(ev, CHORD.paste) || (e.shiftKey && !e.ctrlKey && e.key === "Insert")) {
+      paste("clipboard");
+      claim();
       return;
     }
 
     // §0.8 wants every action reachable without a mouse, and scrollback is an
     // action. Shift+PageUp/Down is the convention every terminal uses.
-    if (e.shiftKey && (e.key === "PageUp" || e.key === "PageDown")) {
+    if (e.shiftKey && !e.ctrlKey && (e.key === "PageUp" || e.key === "PageDown")) {
       const page = Math.max(1, gridRef.current.rows - 1);
       void scrollSession(id, e.key === "PageUp" ? page : -page);
-      e.preventDefault();
-      e.stopPropagation();
+      claim();
       return;
     }
 
-    const bytes = keyToBytes(e.nativeEvent);
+    const bytes = keyToBytes(ev, modes.current);
     if (!bytes) return;
-    e.preventDefault();
-    e.stopPropagation();
+    claim();
+    clearSelection();
+    for (const target of targets()) void writeSession(target, bytes);
+  }, [clearSelection, paste, selectedText, targets]);
 
-    if (broadcast && tabId) {
-      // Step 9's broadcast. The target list comes from THIS tab's pane tree,
-      // never "every open session" — a background tab must not be typed into.
-      const tree = usePanes.getState().trees[tabId];
-      const targets = tree ? sessionsFor(leaves(tree)) : [id];
-      for (const target of targets) void writeSession(target, bytes);
-      return;
-    }
+  /* ---- Mouse: select, copy to PRIMARY, middle-click paste ---------------- */
 
-    void writeSession(id, bytes);
-  }, [adjustFont, resetFont, broadcast, tabId]);
+  const onMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      // Middle button: paste PRIMARY, as every X11 and Wayland terminal does.
+      if (e.button === 1) {
+        e.preventDefault();
+        wrapRef.current?.focus();
+        paste("primary");
+        return;
+      }
+      if (e.button !== 0) return;
+      // preventDefault stops the browser starting a native text drag, and also
+      // its focus handling — so focus explicitly.
+      e.preventDefault();
+      wrapRef.current?.focus();
+      endDrag.current?.();
+
+      const p = cellAt(e.clientX, e.clientY);
+
+      // Double-click: word. Triple-click: whole row.
+      if (e.detail >= 2) {
+        const cells = Array.from(lines.current.get(p.row)?.text ?? "");
+        const [c0, c1] =
+          e.detail === 2 ? wordAt(cells, p.col) : [0, gridRef.current.cols - 1];
+        selection.current = { a: { row: p.row, col: c0 }, b: { row: p.row, col: c1 } };
+        drawSelection();
+        publishPrimary();
+        return;
+      }
+
+      // Shift+click extends the existing selection to here.
+      const existing = selection.current;
+      if (e.shiftKey && existing) {
+        selection.current = { a: existing.a, b: p };
+        drawSelection();
+        publishPrimary();
+        return;
+      }
+
+      // A plain click clears; only an actual drag selects, so clicking to focus
+      // never highlights the cell under the pointer.
+      clearSelection();
+      const anchor = p;
+      const move = (ev: MouseEvent) => {
+        const q = cellAt(ev.clientX, ev.clientY);
+        if (!selection.current && q.row === anchor.row && q.col === anchor.col) return;
+        selection.current = { a: anchor, b: q };
+        drawSelection();
+      };
+      const stop = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        endDrag.current = null;
+      };
+      const up = () => {
+        stop();
+        publishPrimary();
+      };
+      // On window, so a drag that leaves the pane keeps tracking.
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      endDrag.current = stop;
+    },
+    [cellAt, clearSelection, drawSelection, paste, publishPrimary],
+  );
+
+  // A pane closed mid-drag must not leave listeners on the window.
+  useEffect(() => () => endDrag.current?.(), []);
 
   return (
     <section
@@ -564,9 +795,15 @@ export function TerminalSurface({
         aria-label="Terminal"
         onKeyDown={onKeyDown}
         onWheel={onWheel}
-        className="term relative min-h-0 flex-1 outline-none focus-visible:outline-none"
+        onMouseDown={onMouseDown}
+        className="term relative min-h-0 flex-1 cursor-text outline-none focus-visible:outline-none"
       >
         <canvas ref={canvasRef} className="block h-full w-full" />
+        <canvas
+          ref={overlayRef}
+          aria-hidden
+          className="pointer-events-none absolute inset-0 block h-full w-full"
+        />
         {!active && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
             <span className="text-small text-text-lo">click to focus</span>

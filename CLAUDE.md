@@ -722,3 +722,36 @@ transport exists, so check the arguments first.
 It surfaced only because a stale test was renamed to assert that the error
 *names what is missing*. Assertions on error text are usually noise; for
 user-facing errors they are the only thing that catches this class of bug.
+
+### 18.16 Linux: the child inherits the launcher's environment
+
+On Windows, ConPTY ignores `TERM`, so nothing ever set it. On Linux the shell
+inherits whatever launched OpsPilot: **no `TERM` at all** from a desktop icon,
+or the *parent* emulator's identity (`xterm-kitty`, `VTE_VERSION`) from a
+terminal. Both are wrong, silently. Set `TERM`/`COLORTERM` explicitly and strip
+other emulators' markers before spawn.
+
+Related Linux facts that look like bugs elsewhere:
+
+- `/bin` is a symlink to `/usr/bin` on every usr-merged distro, so the same
+  binary has two paths. Dedupe by **canonical path**, and discover shells from
+  `/etc/shells` rather than hardcoding locations.
+- A closed PTY reads as `EIO`, not EOF; a signal mid-read is `EINTR` and is not
+  the end of the session.
+- `rename` is only durable once the **parent directory** is fsynced.
+- WebKitGTK's DMA-BUF renderer breaks on the proprietary NVIDIA driver. Disable
+  it only there — on Mesa it is the fast path.
+
+### 18.17 ConPTY hid the whole input side
+
+ConPTY consumes the application's output, tracks its modes, and re-encodes
+input. So on Windows a terminal that ignores DECCKM (`?1`), bracketed paste
+(`?2004`) and DECTCEM (`?25`) still appears to work. On a Unix PTY it does not:
+ncurses enables application-cursor mode via terminfo `smkx` and then reads
+`ESC[A` as garbage, so arrow keys break in htop, nano and mc. **zsh sets DECCKM at
+every prompt.** Track these modes in `Screen::modes()` and encode input from them.
+
+The same lesson applies to key bindings. ⌘ maps to Ctrl only for apps whose
+window is not a terminal. Ctrl+W, Ctrl+K, Ctrl+B and Ctrl+I (which *is* Tab) all
+belong to the shell, so off macOS app chords are Ctrl+Shift (D-24). Before binding
+anything, check what the key sends to a shell.

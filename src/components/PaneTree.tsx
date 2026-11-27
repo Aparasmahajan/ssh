@@ -41,8 +41,16 @@ export function PaneTree({
 
   // Closing the last pane closes the tab: a tab with no panes is not a state
   // worth representing.
+  //
+  // Only once a tree has EXISTED. On the first render `tree` is undefined
+  // because `ensure` has not run yet, and both effects fire in the same commit:
+  // `ensure` updates the store, but this effect still sees the render's stale
+  // `undefined`. Testing `tree === undefined` alone closed every new tab the
+  // instant it opened, so no terminal could ever be started.
+  const hadTree = useRef(false);
   useEffect(() => {
-    if (tree === undefined) onCloseTab();
+    if (tree !== undefined) hadTree.current = true;
+    else if (hadTree.current) onCloseTab();
   }, [tree, onCloseTab]);
 
   useEffect(() => {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { TREE_MAX, TREE_MIN, useLayout } from "@/state/layout";
 import { useSessions } from "@/state/sessions";
-import { hasMod } from "@/lib/platform";
+import { CHORD, isAppChord } from "@/lib/platform";
 import { isFontZoomKey, useSettings } from "@/state/settings";
 import { IS_DESKTOP } from "@/lib/runtime";
 import type { ConnectionInfo } from "@/lib/remote";
@@ -342,30 +342,41 @@ function useShellKeybindings(togglePalette: () => void) {
         if (zoom === "in") st.adjustFont(1);
         else if (zoom === "out") st.adjustFont(-1);
         else st.resetFont();
+        // Stop here: the terminal must not see it too. It used to handle zoom
+        // itself as well, so each press inside a terminal changed size twice.
         e.preventDefault();
+        e.stopPropagation();
         return;
       }
 
       const s = useLayout.getState();
-      if (e.key === "Escape" && s.zoomed) {
+      // Escape leaves zoom — except from inside a terminal, where Escape is
+      // vim's most-pressed key and must not also unzoom the pane every time.
+      // From there, the zoom chord toggles it back.
+      if (e.key === "Escape" && s.zoomed && !inTerminal(e.target)) {
         s.toggleZoom();
         e.preventDefault();
         return;
       }
-      if (!hasMod(e) || e.altKey) return;
-      // Tab bindings (W, digits, shift-brackets) belong to SessionTabs.
-      if (e.shiftKey) return;
-
-      const key = e.key.toLowerCase();
-      if (key === "k") togglePalette();
-      else if (key === "b") s.toggleTree();
-      else if (key === "i") s.toggleInspector();
-      else if (e.key === "Enter") s.toggleZoom();
+      // Ctrl+Shift on Linux/Windows, ⌘ on macOS — see `isAppChord` for why
+      // plain Ctrl cannot be used: Ctrl+K, Ctrl+B and Ctrl+I are the shell's.
+      if (isAppChord(e, CHORD.palette)) togglePalette();
+      else if (isAppChord(e, CHORD.tree)) s.toggleTree();
+      else if (isAppChord(e, CHORD.inspector)) s.toggleInspector();
+      else if (isAppChord(e, CHORD.zoom)) s.toggleZoom();
       else return;
 
+      // stopPropagation as well: a focused terminal would otherwise also
+      // receive Ctrl+Shift+K and send 0x0B (kill-line) to the shell.
       e.preventDefault();
+      e.stopPropagation();
     };
     window.addEventListener("keydown", onKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, [togglePalette]);
+}
+
+/** Is this event target inside a terminal surface? */
+function inTerminal(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest('[aria-label="Terminal"]') !== null;
 }

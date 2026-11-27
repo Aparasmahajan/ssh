@@ -24,7 +24,9 @@ fn exists(p: &str) -> bool {
     std::path::Path::new(p).is_file()
 }
 
-/// Look up a bare command name on `PATH`.
+/// Look up a bare command name on `PATH`. Windows-only: Unix discovery reads
+/// `/etc/shells` instead, so this would be dead code there.
+#[cfg(windows)]
 fn on_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -148,43 +150,90 @@ fn candidates() -> Vec<ShellInfo> {
     out
 }
 
+/// Entries in `/etc/shells` that are not something a person types into.
+#[cfg(not(windows))]
+const NOT_INTERACTIVE: &[&str] = &[
+    "nologin", "false", "true", "git-shell", "tmux", "screen", "rbash", "rzsh", "rksh",
+];
+
+/// Unix shells: `$SHELL` first, then whatever `/etc/shells` lists.
+///
+/// `/etc/shells` is the system's own answer to "which shells are installed",
+/// and it is the only list that is right on every distro: zsh is `/usr/bin/zsh`
+/// on Debian, `/bin/zsh` on Arch, `/usr/local/bin/zsh` from Homebrew, and fish
+/// lives in three places. Hardcoding paths gets one of those wrong.
+///
+/// Entries are deduplicated by **canonical path**. Since the `/usr` merge,
+/// `/bin` is a symlink to `/usr/bin` on Debian, Fedora, Arch and Ubuntu, so
+/// `/etc/shells` lists `/bin/bash` and `/usr/bin/bash` — the same binary. They
+/// are also deduplicated by name, for the systems where they are two copies.
 #[cfg(not(windows))]
 fn candidates() -> Vec<ShellInfo> {
-    let mut out = Vec::new();
+    let mut out: Vec<ShellInfo> = Vec::new();
+    let mut seen_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen_names: Vec<String> = Vec::new();
+
+    let mut offer = |id: Option<&str>, label_suffix: &str, path: &str| {
+        if !exists(path) {
+            return;
+        }
+        let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        // Applies to $SHELL too: a service account's is `nologin`.
+        if NOT_INTERACTIVE.contains(&name.as_str()) {
+            return;
+        }
+        let canonical =
+            std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        if seen_paths.contains(&canonical) || seen_names.contains(&name) {
+            return;
+        }
+        seen_paths.push(canonical);
+        seen_names.push(name.clone());
+        out.push(ShellInfo {
+            id: id.map(String::from).unwrap_or_else(|| name.clone()),
+            label: format!("{name}{label_suffix}"),
+            program: path.into(),
+            // Interactive, not login: what GNOME Terminal and Konsole do. A
+            // login shell re-runs ~/.profile on every tab, which the desktop
+            // session already did once.
+            args: vec!["-i".into()],
+            env: vec![],
+        });
+    };
 
     if let Ok(sh) = std::env::var("SHELL") {
-        if exists(&sh) {
-            let label = std::path::Path::new(&sh)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Login shell".into());
-            out.push(ShellInfo {
-                id: "login".into(),
-                label: format!("{label} (login shell)"),
-                program: sh,
-                args: vec!["-i".into()],
-                env: vec![],
-            });
-        }
+        offer(Some("login"), " (default)", &sh);
     }
 
-    for (id, label, path) in [
-        ("bash", "bash", "/bin/bash"),
-        ("zsh", "zsh", "/bin/zsh"),
-        ("fish", "fish", "/usr/bin/fish"),
-        ("sh", "sh", "/bin/sh"),
-    ] {
-        if exists(path) && !out.iter().any(|s| s.program == path) {
-            out.push(ShellInfo {
-                id: id.into(),
-                label: label.into(),
-                program: path.into(),
-                args: vec!["-i".into()],
-                env: vec![],
-            });
-        }
+    let listed = std::fs::read_to_string("/etc/shells").unwrap_or_default();
+    let from_file = listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'));
+    // Fallbacks for a system with no /etc/shells (minimal containers, NixOS
+    // without the file populated). The dedup above makes them free otherwise.
+    let fallbacks = ["/bin/bash", "/usr/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/bin/sh"];
+    for path in from_file.chain(fallbacks) {
+        offer(None, "", path);
     }
 
+    // `/etc/shells` is in install order, which puts `/bin/sh` first on Debian.
+    // Keep the user's default on top, then the shells people actually pick.
+    // Stable sort: anything unranked keeps its file order. O(n log n), n < 20.
+    let rank = |s: &ShellInfo| match s.id.as_str() {
+        "login" => 0,
+        "bash" => 1,
+        "zsh" => 2,
+        "fish" => 3,
+        "sh" | "dash" => 9,
+        _ => 5,
+    };
+    out.sort_by_key(rank);
     out
 }
 
@@ -237,6 +286,31 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len(), "duplicate shell ids");
+    }
+
+    /// usr-merged distros list `/bin/zsh` and `/usr/bin/zsh` in /etc/shells and
+    /// often set `$SHELL` to one of them: three spellings, one binary, and a
+    /// picker that offers "zsh" twice.
+    #[cfg(unix)]
+    #[test]
+    fn no_binary_is_offered_twice() {
+        let mut canon: Vec<_> = available()
+            .iter()
+            .map(|s| std::fs::canonicalize(&s.program).unwrap())
+            .collect();
+        let before = canon.len();
+        canon.sort();
+        canon.dedup();
+        assert_eq!(before, canon.len(), "same shell offered under two paths");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_interactive_entries_are_never_offered() {
+        for s in available() {
+            let name = s.program.rsplit('/').next().unwrap_or("");
+            assert!(!NOT_INTERACTIVE.contains(&name), "offered {}", s.program);
+        }
     }
 
     #[test]

@@ -147,9 +147,7 @@ impl Grid {
     }
 
     pub fn mark_all_dirty(&mut self) {
-        for w in &mut self.dirty {
-            *w = u64::MAX;
-        }
+        self.dirty.fill(u64::MAX);
         // Clear bits past the last real row so `dirty_rows` never yields one —
         // the renderer would upload past the end of the grid.
         let excess = dirty_words(self.rows) * 64 - self.rows;
@@ -161,9 +159,7 @@ impl Grid {
     }
 
     pub fn clear_damage(&mut self) {
-        for w in &mut self.dirty {
-            *w = 0;
-        }
+        self.dirty.fill(0);
     }
 
     pub fn is_dirty(&self, row: usize) -> bool {

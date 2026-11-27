@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { load, save } from "@/lib/persist";
+import { hasMod } from "@/lib/platform";
 
 /**
  * User settings that are not per-workspace.
@@ -73,14 +74,16 @@ export const useSettings = create<SettingsState>((set, get) => ({
  * zoom shortcuts feel broken on some layouts.
  */
 export function isFontZoomKey(e: KeyboardEvent): "in" | "out" | "reset" | null {
-  if (!(e.ctrlKey || e.metaKey) || e.altKey) return null;
+  // The platform modifier only: on macOS Ctrl+- is a control code a terminal
+  // program may want, and ⌘ is the zoom key there anyway.
+  if (!hasMod(e) || e.altKey) return null;
   switch (e.key) {
     case "+":
     case "=":
     case "Add":
       return "in";
+    // Not "_": Ctrl+Shift+- is Ctrl+_, readline's undo, and belongs to the shell.
     case "-":
-    case "_":
     case "Subtract":
       return "out";
     case "0":

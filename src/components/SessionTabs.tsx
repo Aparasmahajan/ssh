@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { useSessions } from "@/state/sessions";
-import { hasMod } from "@/lib/platform";
+import { CHORD, hasMod, isAppChord } from "@/lib/platform";
 
 /**
  * The session tab strip — UI_BUILD_GUIDE Step 6.
  *
- * Built: middle-click closes, ⌘1–9 jumps, ⌘W closes, ⌘⇧[ / ⌘⇧] cycle, and
+ * Built: middle-click closes, ⌘1–9 jumps, ⌘W closes (Ctrl+Shift+W off macOS),
+ * ⌘⇧[ / ⌘⇧] and Ctrl+PageUp/PageDown cycle, and
  * drag-to-reorder (also ⌘⇧PageUp/PageDown, because §0.8 requires every action to
  * be reachable without a mouse and a drag handle is the easiest place to forget
  * that).
@@ -23,6 +24,23 @@ export function SessionTabs({ onNew }: { onNew: () => void }) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const claim = () => {
+        // stopPropagation on every claimed chord, or a focused terminal also
+        // receives it and sends the key's control byte to the shell.
+        e.preventDefault();
+        e.stopPropagation();
+      };
+
+      // ⌘W on macOS, Ctrl+Shift+W elsewhere. Plain Ctrl+W is the shell's
+      // delete-previous-word: binding it here closed the session in the middle
+      // of editing a command line.
+      if (isAppChord(e, CHORD.closeTab)) {
+        const { activeId: id } = useSessions.getState();
+        if (id) close(id);
+        claim();
+        return;
+      }
+
       if (!hasMod(e)) return;
 
       // Move the active tab. PageUp/PageDown rather than the arrows: the arrows
@@ -32,25 +50,27 @@ export function SessionTabs({ onNew }: { onNew: () => void }) {
         const { tabs: ts, activeId: id } = useSessions.getState();
         const i = ts.findIndex((t) => t.id === id);
         if (i >= 0 && id) move(id, i + (e.key === "PageDown" ? 1 : -1));
-        e.preventDefault();
-        e.stopPropagation();
+        claim();
         return;
       }
 
-      if (e.shiftKey && (e.key === "[" || e.key === "]")) {
-        cycle(e.key === "]" ? 1 : -1);
-        e.preventDefault();
+      // Cycle. Ctrl+PageUp/PageDown is the GNOME Terminal and Firefox chord;
+      // ⌘⇧[ / ⌘⇧] the macOS one. Matched on `code`, because Shift+[ arrives as
+      // `e.key === "{"` on most layouts and the old check never fired.
+      if (!e.shiftKey && !e.altKey && (e.key === "PageUp" || e.key === "PageDown")) {
+        cycle(e.key === "PageDown" ? 1 : -1);
+        claim();
         return;
       }
-      if (e.key.toLowerCase() === "w") {
-        const { activeId: id } = useSessions.getState();
-        if (id) close(id);
-        e.preventDefault();
+      if (e.shiftKey && (e.code === "BracketLeft" || e.code === "BracketRight")) {
+        cycle(e.code === "BracketRight" ? 1 : -1);
+        claim();
         return;
       }
-      if (/^[1-9]$/.test(e.key)) {
+      // Ctrl/⌘+1–9. No control code lives on the digits, so plain Ctrl is safe.
+      if (!e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
         activateIndex(Number(e.key));
-        e.preventDefault();
+        claim();
       }
     };
     // Capture phase: a focused terminal wants nearly every key, but not these.

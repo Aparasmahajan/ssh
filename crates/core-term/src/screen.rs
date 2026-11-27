@@ -30,6 +30,38 @@ pub struct Screen {
     pending_wrap: bool,
     saved_cursor: Cursor,
     pub title: String,
+    modes: Modes,
+}
+
+/// DEC private modes that change what the *input* side must send.
+///
+/// The screen does not act on these itself — it only remembers them, because
+/// the keyboard encoder and the paste path need them and both live above it.
+///
+/// On Windows none of this was visible: ConPTY consumes the application's
+/// output, tracks these modes itself, and re-encodes input. A raw Unix PTY does
+/// not, so the terminal must. Ignoring DECCKM is the classic symptom — with
+/// `TERM=xterm-256color`, ncurses sends `ESC [ ? 1 h` and then only recognises
+/// `ESC O A` as Up, so arrows in htop, nano and mc print letters instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Modes {
+    /// `?1` DECCKM: cursor keys send `ESC O x` instead of `ESC [ x`.
+    pub app_cursor: bool,
+    /// `?2004`: pasted text must be wrapped in `ESC [200~ … ESC [201~`, so the
+    /// shell inserts it instead of executing each line as it arrives.
+    pub bracketed_paste: bool,
+    /// `?25` DECTCEM. Full-screen programs hide the cursor while they draw.
+    pub cursor_visible: bool,
+}
+
+impl Default for Modes {
+    fn default() -> Self {
+        Modes {
+            app_cursor: false,
+            bracketed_paste: false,
+            cursor_visible: true,
+        }
+    }
 }
 
 impl Screen {
@@ -44,6 +76,36 @@ impl Screen {
             pending_wrap: false,
             saved_cursor: Cursor::default(),
             title: String::new(),
+            modes: Modes::default(),
+        }
+    }
+
+    /// Input-affecting modes the application has set. See [`Modes`].
+    #[inline]
+    pub fn modes(&self) -> Modes {
+        self.modes
+    }
+
+    /// DECSET / DECRST for one parameter. Unknown modes are ignored, as every
+    /// terminal does — an application probing for a feature must not break.
+    fn set_private_mode(&mut self, mode: u16, on: bool, cursor: Cursor) {
+        match mode {
+            1 => self.modes.app_cursor = on,
+            25 => self.modes.cursor_visible = on,
+            2004 => self.modes.bracketed_paste = on,
+            // 1049 / 1047 / 47: alternate screen
+            1049 | 1047 | 47 => {
+                if on {
+                    self.saved_cursor = cursor;
+                    self.enter_alt();
+                    self.move_to(0, 0);
+                } else {
+                    self.leave_alt();
+                    let c = self.saved_cursor;
+                    self.move_to(c.row, c.col);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -400,19 +462,12 @@ impl Perform for Screen {
                 }
             }
             b'm' => self.sgr(params),
-            b'h' if private => {
-                // 1049 / 1047 / 47: alternate screen
-                if matches!(params.raw(0), 1049 | 1047 | 47) {
-                    self.saved_cursor = cursor;
-                    self.enter_alt();
-                    self.move_to(0, 0);
-                }
-            }
-            b'l' if private => {
-                if matches!(params.raw(0), 1049 | 1047 | 47) {
-                    self.leave_alt();
-                    let c = self.saved_cursor;
-                    self.move_to(c.row, c.col);
+            // DECSET/DECRST take a parameter LIST: `ESC [ ? 1 ; 2004 h` is two
+            // modes, and reading only the first silently drops the rest.
+            b'h' | b'l' if private => {
+                let on = action == b'h';
+                for i in 0..params.len().max(1) {
+                    self.set_private_mode(params.raw(i), on, cursor);
                 }
             }
             b's' => self.saved_cursor = cursor,
@@ -440,9 +495,13 @@ impl Perform for Screen {
                 }
             }
             b'c' => {
+                // RIS. `reset` after a crashed TUI must also restore the input
+                // modes, or the arrows stay in application mode at the prompt.
+                self.leave_alt();
                 self.grid.clear_all(DEFAULT_STYLE);
                 self.set_pen(Style::default());
                 self.move_to(0, 0);
+                self.modes = Modes::default();
             }
             _ => {}
         }
@@ -615,6 +674,61 @@ mod tests {
             sb_len,
             "vim repaints must not fill the scrollback ring"
         );
+    }
+
+    #[test]
+    fn decckm_bracketed_paste_and_cursor_visibility_are_tracked() {
+        let mut s = Screen::new(2, 8);
+        assert_eq!(s.modes(), Modes::default());
+        assert!(s.modes().cursor_visible);
+
+        // What ncurses sends on startup with TERM=xterm-256color (smkx).
+        feed(&mut s, b"\x1b[?1h\x1b=");
+        assert!(s.modes().app_cursor);
+        feed(&mut s, b"\x1b[?1l");
+        assert!(!s.modes().app_cursor);
+
+        feed(&mut s, b"\x1b[?2004h");
+        assert!(s.modes().bracketed_paste);
+        feed(&mut s, b"\x1b[?25l");
+        assert!(!s.modes().cursor_visible);
+        feed(&mut s, b"\x1b[?25h");
+        assert!(s.modes().cursor_visible);
+    }
+
+    #[test]
+    fn every_parameter_of_a_decset_list_applies() {
+        // Reading only the first parameter would leave DECCKM off here and the
+        // arrows broken in whatever sent it.
+        let mut s = Screen::new(2, 8);
+        feed(&mut s, b"\x1b[?2004;1;1049h");
+        assert!(s.modes().bracketed_paste);
+        assert!(s.modes().app_cursor);
+        assert!(s.alt_active());
+
+        feed(&mut s, b"\x1b[?1049;1l");
+        assert!(!s.alt_active());
+        assert!(!s.modes().app_cursor);
+        assert!(s.modes().bracketed_paste, "a mode not in the list is untouched");
+    }
+
+    #[test]
+    fn ansi_mode_sequences_do_not_set_private_modes() {
+        // `CSI 1 h` without `?` is an ANSI mode (unused here), not DECCKM.
+        let mut s = Screen::new(2, 8);
+        feed(&mut s, b"\x1b[1h\x1b[2004h");
+        assert_eq!(s.modes(), Modes::default());
+    }
+
+    #[test]
+    fn full_reset_restores_input_modes_and_leaves_the_alt_screen() {
+        // `reset` after a TUI crashed in application-cursor mode is how a user
+        // gets working arrow keys back at the prompt.
+        let mut s = Screen::new(2, 8);
+        feed(&mut s, b"\x1b[?1;2004;1049h\x1b[?25l");
+        feed(&mut s, b"\x1bc");
+        assert_eq!(s.modes(), Modes::default());
+        assert!(!s.alt_active());
     }
 
     #[test]
