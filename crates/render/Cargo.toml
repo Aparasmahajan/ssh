@@ -6,8 +6,36 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# No dependencies yet, deliberately. CLAUDE.md §16: "No new dependency without a
-# note on binary size and cold-start impact" — and §3 requires the engine crates
-# to sit behind feature flags and lazy-load, so russh/wgpu/arrow arrive with the
-# code that uses them, not before it.
+# CLAUDE.md §16, size and cold-start notes per dependency:
+#
+# - wgpu: the GPU path itself, the reason this crate exists. Several MB of code,
+#   but nothing runs until a terminal pane opens; adapter and device creation
+#   are the cold-start cost (tens of ms on Mesa), paid once, off the UI thread.
+# - swash: rasterizer with TrueType hinting, ~400 KB. No system font scan, no
+#   FreeType: it reads the embedded faces in place.
+# - bytemuck: casts the instance array to bytes. No code at runtime.
+# - pollster: blocks on wgpu's adapter/device futures, a few hundred lines.
+#
+# Fonts: JetBrains Mono NL (OFL, fonts/OFL.txt), subset to the terminal's
+# ranges with fontTools, about 130 KB per face, 4 faces, embedded with
+# include_bytes. Embedding beats a system lookup on cold start, and makes the
+# cell metrics identical on every machine.
 [dependencies]
+opspilot-core-term = { path = "../core-term" }
+wgpu = "30"
+swash = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+# ash: raw Vulkan for `present`, the damage-only swapchain. Already linked:
+# wgpu's Vulkan backend is built on it, and this is the same version
+# (0.38), so it adds no code and no compile time, only the bindings we call.
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "frame"
+harness = false
