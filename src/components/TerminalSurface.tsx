@@ -15,6 +15,15 @@ import {
   type ShellInfo,
 } from "@/lib/session";
 import { sshOpenShell, type ConnectionInfo } from "@/lib/remote";
+import {
+  coveredByOverlay,
+  gpuAvailable,
+  gpuPaneRemove,
+  gpuPaneSet,
+  NATIVE_KEY_EVENT,
+  type PaneState,
+} from "@/lib/gpuTerm";
+import { listen } from "@tauri-apps/api/event";
 import { isReadOnly, openStream, streamTitle, type StreamSource } from "@/lib/streams";
 import { sessionsFor } from "@/lib/broadcast";
 import { acquire, keyOf, release } from "@/state/terminals";
@@ -44,6 +53,20 @@ import { useSettings } from "@/state/settings";
  * What it cannot do, and is the reason it is temporary: the glyphs are rasterised
  * by the browser on the UI thread, so a flood competes with React for the same
  * thread — exactly the coupling §3 exists to forbid.
+ *
+ * ## The GPU path (Linux/X11)
+ *
+ * Where `gpu_pane_set` succeeds, Rust draws this pane in a native child window
+ * over the canvas (`crates/app/src/gpu_term.rs`) and the canvas stops painting.
+ * This component still owns input, selection and layout, and reports the
+ * pane's rect, focus and selection once per frame when they change. While an
+ * overlay (`data-overlay`) covers the pane the native view hides and the
+ * canvas, kept current underneath, paints again. Cell metrics then come from
+ * Rust (whole pixels), so both paths lay out the same grid.
+ *
+ * Keys: while a GPU pane has focus, Rust types into the session itself and the
+ * page only sees app chords (`crates/app/src/keys.rs`). `onKeyDown` below is
+ * then the path for those chords, and the whole path on the canvas.
  */
 
 const PADDING = 6;
@@ -174,6 +197,16 @@ export function TerminalSurface({
   const cursorColor = useRef<string>("");
   const bgColor = useRef<string>("");
   const gridRef = useRef({ rows: 24, cols: 80 });
+  /** GPU path state. `live`: the native view is drawing; `covered`: an
+   *  overlay hides it, so the canvas paints instead. */
+  const gpu = useRef({ live: false, covered: false, inFlight: false, again: false, sent: "" });
+  /** Send the pane state now rather than at the next frame (focus changes). */
+  const syncNow = useRef<() => void>(() => {});
+  /** Broadcast settings, read from the per-frame sync without re-running it. */
+  const bcast = useRef({ broadcast, tabId });
+  bcast.current = { broadcast, tabId };
+  /** Cell size from Rust while the GPU path is on, in CSS px. */
+  const gpuCell = useRef<Cell | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [exited, setExited] = useState(false);
@@ -217,6 +250,9 @@ export function TerminalSurface({
 
   /* ---- Measure the cell from the actual loaded font --------------------- */
   const measure = useCallback((ctx: CanvasRenderingContext2D): Cell => {
+    // The native renderer's cells are whole pixels; the canvas must lay out
+    // the same grid or the two disagree on the column count.
+    if (gpuCell.current) return gpuCell.current;
     ctx.font = fontFor(termFamily(), fontRef.current, false, false);
     // "M" in a monospace face is the advance width. Measuring a long run and
     // dividing avoids accumulating the sub-pixel error of a single glyph.
@@ -337,7 +373,9 @@ export function TerminalSurface({
   }, []);
 
   const clearSelection = useCallback(() => {
-    if (selection.current === null) return;
+    // Always redraw, even when already empty: the highlight layer is the
+    // source of truth only for what is drawn, and with the GPU path it can
+    // sit hidden for minutes before an overlay reveals it.
     selection.current = null;
     drawSelection();
   }, [drawSelection]);
@@ -519,13 +557,21 @@ export function TerminalSurface({
           if (!snap.alive) setExited(true);
           setScrolled(snap.scroll_offset);
 
+          // The native view is showing: keep the rows (selection text, word
+          // select, the canvas fallback) but draw nothing.
+          const paints = !(gpu.current.live && !gpu.current.covered);
+
           if (snap.full) {
             // Scrolled or resized: viewport rows now hold different lines, so a
             // selection in viewport coordinates would point at the wrong text.
             clearSelection();
             lines.current.clear();
             for (const l of snap.lines) lines.current.set(l.row, l);
-            repaintAll(ctx);
+            if (paints) repaintAll(ctx);
+            return;
+          }
+          if (!paints) {
+            for (const l of snap.lines) lines.current.set(l.row, l);
             return;
           }
 
@@ -546,18 +592,134 @@ export function TerminalSurface({
         });
     };
 
+    /** Report this pane to the native renderer when anything it draws from
+     *  changes. One `getBoundingClientRect` and a string compare per frame. */
+    const syncGpu = () => {
+      const id = sessionId.current;
+      const wrap = wrapRef.current;
+      const ctx = canvasRef.current?.getContext("2d");
+      if (id === null || !wrap || !ctx || !gpuAvailable()) return;
+      const g = gpu.current;
+      const r = wrap.getBoundingClientRect();
+      const covered = r.width < 1 || r.height < 1 || coveredByOverlay(r);
+      if (covered !== g.covered) {
+        g.covered = covered;
+        // The overlay is up this frame; the native view hides one IPC later.
+        // Paint the canvas now so there is something under the overlay.
+        if (covered && g.live) {
+          repaintAll(ctx);
+          drawSelection();
+        }
+      }
+      const sel = selection.current ? ordered(selection.current) : null;
+      const state: PaneState = {
+        pane,
+        session: id,
+        rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+        dpr: window.devicePixelRatio || 1,
+        font_px: fontRef.current,
+        line_px: lineRef.current,
+        visible: !covered,
+        focused: document.activeElement === wrap,
+        selection: sel ? [[sel[0].row, sel[0].col], [sel[1].row, sel[1].col]] : null,
+        targets: (() => {
+          const { broadcast: on, tabId: tab } = bcast.current;
+          const tree = on && tab ? usePanes.getState().trees[tab] : undefined;
+          return tree ? sessionsFor(leaves(tree)) : [id];
+        })(),
+      };
+      const key = JSON.stringify(state);
+      // Unchanged: nothing to send, unless still waiting for the view to go live.
+      if (key === g.sent && (g.live || covered)) return;
+      if (g.inFlight) {
+        // A focus change must not wait a frame behind an in-flight update:
+        // keys typed meanwhile would go to the pane focus just left.
+        g.again = true;
+        return;
+      }
+      g.inFlight = true;
+      g.sent = key;
+      const settle = () => {
+        g.inFlight = false;
+        if (g.again) {
+          g.again = false;
+          syncGpu();
+        }
+      };
+      gpuPaneSet(state)
+        .then((info) => {
+          settle();
+          if (!info) {
+            // No GPU path here: back to the canvas, measured by the canvas.
+            const was = g.live;
+            g.live = false;
+            if (gpuCell.current) {
+              gpuCell.current = null;
+              cellRef.current = measure(ctx);
+            }
+            if (was) repaintAll(ctx);
+            return;
+          }
+          const cell = gpuCell.current;
+          if (!cell || cell.w !== info.cell_w || cell.h !== info.cell_h) {
+            gpuCell.current = { w: info.cell_w, h: info.cell_h };
+            cellRef.current = gpuCell.current;
+            const fit = fitToBox();
+            const sid = sessionId.current;
+            if (sid !== null && (fit.rows !== gridRef.current.rows || fit.cols !== gridRef.current.cols)) {
+              gridRef.current = fit;
+              quiet(resizeSession(sid, fit.rows, fit.cols));
+            }
+            if (!g.live || g.covered) repaintAll(ctx);
+          }
+          g.live = info.live;
+        })
+        .catch(settle);
+    };
+
     const tick = () => {
       raf = requestAnimationFrame(tick);
       poll();
+      syncGpu();
     };
 
     pollNow.current = poll;
+    syncNow.current = syncGpu;
     raf = requestAnimationFrame(tick);
     return () => {
       pollNow.current = () => {};
+      syncNow.current = () => {};
       cancelAnimationFrame(raf);
     };
-  }, [clearSelection, paintCursor, paintRow, repaintAll]);
+  }, [clearSelection, drawSelection, paintCursor, paintRow, repaintAll, fitToBox, measure, pane]);
+
+  // The native view belongs to this mount. A remount (tab switch, split)
+  // attaches a new one; the session itself lives on (§18.18).
+  useEffect(
+    () => () => {
+      gpuPaneRemove(pane);
+      gpu.current = { live: false, covered: false, inFlight: false, again: false, sent: "" };
+    },
+    [pane],
+  );
+
+  // Rust typed a key here natively: clear the selection, as typing always has.
+  useEffect(() => {
+    let off: (() => void) | null = null;
+    let cancelled = false;
+    listen<string>(NATIVE_KEY_EVENT, (e) => {
+      if (e.payload === pane) clearSelection();
+    })
+      .then((f) => {
+        if (cancelled) f();
+        else off = f;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, [pane, clearSelection]);
 
   /* ---- Resize ------------------------------------------------------------ */
 
@@ -884,6 +1046,8 @@ export function TerminalSurface({
         role="application"
         aria-label="Terminal"
         onKeyDown={onKeyDown}
+        onFocus={() => syncNow.current()}
+        onBlur={() => syncNow.current()}
         onWheel={onWheel}
         onMouseDown={onMouseDown}
         className="term relative min-h-0 flex-1 cursor-text outline-none focus-visible:outline-none"

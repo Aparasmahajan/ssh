@@ -116,7 +116,7 @@ export function HostEditor({
   const valid = draft.name.trim() !== "" && draft.address.trim() !== "";
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80 p-6">
+    <div data-overlay className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80 p-6">
       <div className="flex max-h-full w-[620px] flex-col border-hairline border-bezel-500 bg-chassis-800">
         <header className="flex items-center gap-2 border-b-hairline border-bezel-500 px-4 py-2">
           <span className="font-condensed uppercase text-eyebrow text-text-lo">

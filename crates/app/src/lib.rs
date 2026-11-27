@@ -7,7 +7,12 @@ pub mod clipboard;
 pub mod db;
 pub mod docker;
 pub mod forwards;
+#[cfg(target_os = "linux")]
+pub mod gpu_term;
 pub mod k8s;
+pub mod keys;
+#[cfg(all(target_os = "linux", feature = "latency-probe"))]
+pub(crate) mod latency_probe;
 pub mod localfs;
 pub mod remote;
 pub mod session;
@@ -30,6 +35,11 @@ use session::{registry, SessionId, Snapshot};
 /// registration function instead of the commands themselves is what Tauri's own
 /// template does, and it avoids the problem by construction.
 pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    #[cfg(all(target_os = "linux", feature = "latency-probe"))]
+    let builder = builder.setup(|app| {
+        latency_probe::start(app.handle().clone());
+        Ok(())
+    });
     builder.invoke_handler(tauri::generate_handler![
         app_version,
         app_reset,
@@ -41,6 +51,8 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         session_close,
         session_paste,
         session_paste_text,
+        gpu_pane_set,
+        gpu_pane_remove,
         clipboard_write,
         docker_snapshot,
         docker_action,
@@ -171,7 +183,45 @@ async fn session_open(rows: u16, cols: u16, shell: Option<String>) -> Result<Ses
 /// `String` would corrupt them.
 #[tauri::command]
 fn session_write(id: SessionId, bytes: Vec<u8>) -> Result<(), String> {
-    registry().get(id)?.write(&bytes)
+    #[cfg(all(target_os = "linux", feature = "latency-probe"))]
+    latency_probe::mark(latency_probe::Stage::Write);
+    registry().get(id)?.write(&bytes)?;
+    // §5.4's input path: the native renderer draws the echo (or prediction)
+    // the moment it exists instead of at the next frame.
+    #[cfg(target_os = "linux")]
+    gpu_term::wake();
+    Ok(())
+}
+
+/* ---- GPU terminal (crate::gpu_term) ----------------------------------------- */
+
+/// Create or update the native terminal view over a pane. Sync on purpose: it
+/// runs on the GTK main thread, which owns the child windows, and does only
+/// window-system calls there. Fails where the GPU path is unavailable
+/// (Wayland, no adapter, not Linux); the webview then keeps its canvas.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn gpu_pane_set(window: tauri::WebviewWindow, state: gpu_term::PaneState) -> Result<gpu_term::PaneInfo, String> {
+    gpu_term::set(&window, state)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn gpu_pane_set(state: serde_json::Value) -> Result<(), String> {
+    let _ = state;
+    Err("gpu terminal unavailable".into())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn gpu_pane_remove(pane: String) {
+    gpu_term::remove(pane);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn gpu_pane_remove(pane: String) {
+    let _ = pane;
 }
 
 /// Rows changed since `since`. `None` means nothing changed — the common case on

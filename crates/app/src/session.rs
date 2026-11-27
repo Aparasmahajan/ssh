@@ -141,14 +141,21 @@ fn css_color(c: u32, is_bg: bool) -> String {
 
 /* ---- Session ------------------------------------------------------------- */
 
+/// Damage consumers (see `Inner::dirty`).
+const WEB: u8 = 1;
+const GPU: u8 = 2;
+const ALL: u8 = WEB | GPU;
+
 struct Inner {
     screen: Screen,
     parser: Parser,
-    /// Rows changed since the last snapshot. Kept separately from the grid's own
-    /// damage bitset because the grid's is the *renderer's* to clear, and here
-    /// there are two consumers with different clocks.
-    dirty: Vec<bool>,
-    full_repaint: bool,
+    /// Rows changed, per consumer: bit [`WEB`] for the webview's snapshot, bit
+    /// [`GPU`] for the native renderer. Kept separately from the grid's own
+    /// damage bitset because each consumer clears only its own bit, on its own
+    /// clock. Before the GPU path there was one consumer and this was a `bool`;
+    /// a second reader of a shared flag would have stolen the other's damage.
+    dirty: Vec<u8>,
+    full_repaint: u8,
     /// Lines above the live viewport currently being viewed. 0 = live.
     scroll_offset: usize,
     /// Predictive local echo (§5.5). Enabled only for remote sessions: on a
@@ -174,7 +181,7 @@ fn now_ms() -> u64 {
 /// there: confirming or discarding one changes what is drawn, and a snapshot
 /// driven only by grid damage would leave a stale predicted character on screen
 /// with nothing to force a repaint.
-fn reconcile(screen: &Screen, predictor: &mut Predictor, dirty: &mut [bool]) {
+fn reconcile(screen: &Screen, predictor: &mut Predictor, dirty: &mut [u8]) {
     if predictor.outstanding() == 0 {
         // Still called: the predictor watches for output that moves the
         // cursor while nothing is predicted (a program printing a prompt),
@@ -189,7 +196,7 @@ fn reconcile(screen: &Screen, predictor: &mut Predictor, dirty: &mut [bool]) {
     // Rows a confirmation just revealed are dirty too.
     for r in touched.into_iter().chain(predictor.overlay().map(|o| o.row)) {
         if let Some(slot) = dirty.get_mut(r) {
-            *slot = true;
+            *slot = ALL;
         }
     }
 }
@@ -329,6 +336,16 @@ fn lf_to_crlf(chunk: &[u8], prev: &mut u8) -> Vec<u8> {
     out
 }
 
+/// New output is in the screen. Called by every reader right after it bumps
+/// the generation, so the native renderer can draw an echo the moment it lands
+/// instead of on its next poll (§5.4's input path). Outside the moment after a
+/// keystroke this is two atomic loads: output floods stay coalesced to frames.
+#[inline]
+fn output_arrived() {
+    #[cfg(target_os = "linux")]
+    crate::gpu_term::output();
+}
+
 /// Parse one chunk of output into the screen and mark what it damaged.
 fn ingest(inner: &Mutex<Inner>, chunk: &[u8]) {
     if let Ok(mut g) = inner.lock() {
@@ -342,7 +359,7 @@ fn ingest(inner: &Mutex<Inner>, chunk: &[u8]) {
         parser.advance(screen, chunk);
         for r in screen.grid().dirty_rows() {
             if let Some(slot) = dirty.get_mut(r) {
-                *slot = true;
+                *slot = ALL;
             }
         }
         screen.grid_mut().clear_damage();
@@ -497,8 +514,8 @@ impl Session {
         let inner = Arc::new(Mutex::new(Inner {
             screen: Screen::new(rows as usize, cols as usize),
             parser: Parser::new(),
-            dirty: vec![true; rows as usize],
-            full_repaint: true,
+            dirty: vec![ALL; rows as usize],
+            full_repaint: ALL,
             scroll_offset: 0,
             // A local PTY echoes in microseconds. Prediction there is a guess
             // taken against no latency at all, so it is off (§5.5's own
@@ -568,7 +585,7 @@ impl Session {
                                     parser.advance(screen, &buf[..n]);
                                     for r in screen.grid().dirty_rows() {
                                         if let Some(slot) = dirty.get_mut(r) {
-                                            *slot = true;
+                                            *slot = ALL;
                                         }
                                     }
                                     screen.grid_mut().clear_damage();
@@ -578,6 +595,7 @@ impl Session {
                                 // One counter bump, however many bytes arrived.
                                 // The UI samples this; it is never pushed.
                                 generation.fetch_add(1, Ordering::Release);
+                                output_arrived();
                             }
                         }
                     }
@@ -661,8 +679,8 @@ impl Session {
         let inner = Arc::new(Mutex::new(Inner {
             screen: Screen::new(rows as usize, cols as usize),
             parser: Parser::new(),
-            dirty: vec![true; rows as usize],
-            full_repaint: true,
+            dirty: vec![ALL; rows as usize],
+            full_repaint: ALL,
             scroll_offset: 0,
             // §5.5's 20–40x is a *remote* number: it is the round trip that
             // prediction hides. The gate inside the predictor decides the rest.
@@ -688,6 +706,7 @@ impl Session {
                     bytes_in.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     ingest(&inner, &chunk);
                     generation.fetch_add(1, Ordering::Release);
+                    output_arrived();
                 }
                 alive.store(false, Ordering::Release);
                 generation.fetch_add(1, Ordering::Release);
@@ -717,8 +736,8 @@ impl Session {
         let inner = Arc::new(Mutex::new(Inner {
             screen: Screen::new(rows as usize, cols as usize),
             parser: Parser::new(),
-            dirty: vec![true; rows as usize],
-            full_repaint: true,
+            dirty: vec![ALL; rows as usize],
+            full_repaint: ALL,
             scroll_offset: 0,
             // Off: §5.5's gate is built around a shell echoing keystrokes, and a
             // log follow echoes nothing. Exec'd shells could predict, but the
@@ -758,6 +777,7 @@ impl Session {
                         ingest(&inner, &chunk);
                     }
                     generation.fetch_add(1, Ordering::Release);
+                    output_arrived();
                 }
                 alive.store(false, Ordering::Release);
                 generation.fetch_add(1, Ordering::Release);
@@ -805,7 +825,7 @@ impl Session {
         if made > 0 && predictor.cursor().is_some() {
             for o in predictor.overlay() {
                 if let Some(slot) = dirty.get_mut(o.row) {
-                    *slot = true;
+                    *slot = ALL;
                 }
             }
             // §5.4's split render paths: the input path repaints on the input
@@ -942,7 +962,7 @@ impl Session {
         if let Ok(mut g) = self.inner.lock() {
             if g.scroll_offset != 0 {
                 g.scroll_offset = 0;
-                g.full_repaint = true;
+                g.full_repaint = ALL;
                 self.generation.fetch_add(1, Ordering::Release);
             }
 
@@ -961,7 +981,7 @@ impl Session {
             let mut g = self.inner.lock().map_err(|_| "screen poisoned")?;
             if g.scroll_offset != 0 {
                 g.scroll_offset = 0;
-                g.full_repaint = true;
+                g.full_repaint = ALL;
                 self.generation.fetch_add(1, Ordering::Release);
             }
             // A paste can hold Enter, and it never passes through the
@@ -1034,8 +1054,8 @@ impl Session {
         // moved every one of their cells. Dropping them unscored is the honest
         // move: they did not miss, the ground moved.
         g.predictor.reset();
-        g.dirty = vec![true; rows as usize];
-        g.full_repaint = true;
+        g.dirty = vec![ALL; rows as usize];
+        g.full_repaint = ALL;
         // The viewport is re-wrapped by the line above; history is queued and
         // done a chunk at a time from `snapshot` (§5.6). A drag emits a resize
         // per pointer move, so doing it here would reflow 100k rows forty times.
@@ -1063,7 +1083,7 @@ impl Session {
         if g.scroll_offset > 0 {
             // The window onto history now lands on different lines.
             g.scroll_offset = g.scroll_offset.min(g.screen.scrollback().len());
-            g.full_repaint = true;
+            g.full_repaint = ALL;
             return true;
         }
         false
@@ -1088,7 +1108,7 @@ impl Session {
             g.scroll_offset = want;
             // Every visible line changes when the window slides, so this is a
             // repaint, not a damage list.
-            g.full_repaint = true;
+            g.full_repaint = ALL;
             self.generation.fetch_add(1, Ordering::Release);
         }
         Ok(want)
@@ -1114,7 +1134,7 @@ impl Session {
         // `since == 0` is a viewer that has nothing yet — a pane remounted
         // after a tab switch, attaching to a live session. It gets every row,
         // not just the ones damaged since some other viewer last looked.
-        let full = g.full_repaint || since == 0;
+        let full = g.full_repaint & WEB != 0 || since == 0;
         let (rows, cols) = (g.screen.grid().rows(), g.screen.grid().cols());
         // The predicted cursor wins when there is one: it is where the character
         // the user just typed appears to be, and drawing the caret behind it is
@@ -1140,7 +1160,7 @@ impl Session {
             }
         } else {
             for row in 0..rows {
-                let dirty = g.dirty.get(row).copied().unwrap_or(false);
+                let dirty = g.dirty.get(row).is_some_and(|d| d & WEB != 0);
                 // ALWAYS send the cursor row, even when the damage list says it
                 // is clean.
                 //
@@ -1158,9 +1178,9 @@ impl Session {
         }
 
         for d in g.dirty.iter_mut() {
-            *d = false;
+            *d &= !WEB;
         }
-        g.full_repaint = false;
+        g.full_repaint &= !WEB;
 
         Ok(Some(Snapshot {
             generation,
@@ -1179,6 +1199,111 @@ impl Session {
             // screen, not to a row of history that happens to share its index.
             cursor_visible: modes.cursor_visible && offset == 0,
         }))
+    }
+}
+
+/// What the native renderer reads for one frame. Borrowed under the screen
+/// lock, so the closure given to [`Session::paint`] must be quick: it builds
+/// quads for the damaged rows (microseconds per row) and nothing else.
+pub struct PaintView<'a> {
+    pub screen: &'a Screen,
+    /// Predicted cells, drawn over the grid (§5.5). Empty while scrolled back.
+    pub overlay: &'a [Overlay],
+    pub scroll_offset: usize,
+    /// Every row must be rebuilt: first frame, resize, scroll, or scrolled back.
+    pub full: bool,
+    /// Rows changed since the renderer last painted (when not `full`).
+    pub dirty: &'a [usize],
+    pub cursor: opspilot_core_term::Cursor,
+    pub cursor_visible: bool,
+}
+
+impl PaintView<'_> {
+    /// One viewport row as glyph and style planes: the grid row with
+    /// predictions applied, or a line of history while scrolled back. Scratch
+    /// buffers are the caller's so a frame allocates nothing in steady state.
+    /// O(cols).
+    pub fn row<'s>(&'s self, row: usize, g: &'s mut Vec<u32>, st: &'s mut Vec<StyleId>) -> (&'s [u32], &'s [StyleId]) {
+        let screen = self.screen;
+        if self.scroll_offset > 0 {
+            let sb = screen.scrollback();
+            let top = sb.len().saturating_sub(self.scroll_offset);
+            let v = top + row;
+            if v < sb.len() {
+                return sb.get(v).map(|r| (&r.glyph[..], &r.style[..])).unwrap_or((&[], &[]));
+            }
+            let grid_row = v - sb.len();
+            if grid_row >= screen.grid().rows() {
+                return (&[], &[]);
+            }
+            return screen.grid().row(grid_row);
+        }
+        let (glyphs, styles) = screen.grid().row(row);
+        if !self.overlay.iter().any(|o| o.row == row) {
+            return (glyphs, styles);
+        }
+        g.clear();
+        g.extend_from_slice(glyphs);
+        st.clear();
+        st.extend_from_slice(styles);
+        for o in self.overlay.iter().filter(|o| o.row == row) {
+            if o.col < g.len() {
+                g[o.col] = o.glyph;
+                st[o.col] = o.style;
+            }
+        }
+        (&g[..], &st[..])
+    }
+}
+
+impl Session {
+    /// DECCKM, for the native key encoder (`crate::keys`).
+    pub fn app_cursor(&self) -> bool {
+        self.inner.lock().map(|g| g.screen.modes().app_cursor).unwrap_or(false)
+    }
+
+    /// The counter the reader bumps on every change. The renderer compares it
+    /// with the last value it drew, which is one atomic load per idle frame.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Hand the screen to the native renderer and clear its damage.
+    ///
+    /// Same rules as [`Session::snapshot`], for the second consumer: the
+    /// predicted cursor wins, nothing is predicted into history, and the cursor
+    /// row is always included (the bug described in `snapshot`).
+    pub fn paint<R>(&self, f: impl FnOnce(&PaintView<'_>) -> R) -> Result<R, String> {
+        let mut g = self.inner.lock().map_err(|_| "screen poisoned")?;
+        let offset = g.scroll_offset;
+        let full = g.full_repaint & GPU != 0 || offset > 0;
+        let cursor = g.predictor.cursor().unwrap_or(g.screen.grid().cursor);
+        // O(rows) to collect, bounded by the viewport height.
+        let mut dirty: Vec<usize> = g
+            .dirty
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| **d & GPU != 0)
+            .map(|(i, _)| i)
+            .collect();
+        if !dirty.contains(&cursor.row) {
+            dirty.push(cursor.row);
+        }
+        for d in g.dirty.iter_mut() {
+            *d &= !GPU;
+        }
+        g.full_repaint &= !GPU;
+        let overlay: Vec<Overlay> = if offset == 0 { g.predictor.overlay().collect() } else { Vec::new() };
+        let view = PaintView {
+            screen: &g.screen,
+            overlay: &overlay,
+            scroll_offset: offset,
+            full,
+            dirty: &dirty,
+            cursor,
+            cursor_visible: g.screen.modes().cursor_visible && offset == 0,
+        };
+        Ok(f(&view))
     }
 }
 
@@ -1795,6 +1920,39 @@ mod tests {
             t.contains("033   [   2   0   0   ~   a   b  \\r   c   d 033   [   2   0")
         });
         assert!(ok, "unexpected bytes. Screen was:\n{}", screen_text(&session));
+    }
+
+    /// The webview's snapshot and the native renderer each clear only their
+    /// own damage. When this was one flag, whichever polled first took the
+    /// damage and the other drew a stale row.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_and_paint_do_not_steal_each_others_damage() {
+        let session = run_sh("echo ready; read x; echo \"got $x\"; sleep 5");
+        assert!(wait_until(Duration::from_secs(10), || screen_text(&session).contains("ready")));
+        // Drain both consumers.
+        let _ = session.snapshot(0).unwrap();
+        session.paint(|_| ()).unwrap();
+
+        session.write(b"hello\r").unwrap();
+        assert!(wait_until(Duration::from_secs(10), || screen_text(&session).contains("got hello")));
+        let row = |s: &Session| {
+            let g = s.inner.lock().unwrap();
+            (0..g.screen.grid().rows())
+                .find(|&r| g.screen.grid().row(r).0.starts_with(&"got".chars().map(|c| c as u32).collect::<Vec<_>>()))
+                .unwrap()
+        };
+        let got = row(&session);
+
+        // The webview polls first...
+        let snap = session.snapshot(1).unwrap().expect("changed");
+        assert!(snap.lines.iter().any(|l| l.row == got));
+        // ...and the renderer still sees the row as damaged.
+        let dirty = session.paint(|v| v.full || v.dirty.contains(&got)).unwrap();
+        assert!(dirty, "the snapshot consumed the renderer's damage");
+        // Consumed now. The cursor (on the line below) is always reported.
+        let again: Vec<usize> = session.paint(|v| v.dirty.to_vec()).unwrap();
+        assert!(!again.contains(&got), "{again:?}");
     }
 
     #[test]

@@ -247,6 +247,7 @@ export function CommandPalette({
 
   return (
     <div
+      data-overlay
       className="absolute inset-0 z-[60] flex items-start justify-center bg-chassis-900/70 pt-[12vh]"
       onClick={close}
     >

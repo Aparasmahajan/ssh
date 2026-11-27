@@ -46,6 +46,20 @@ portable-pty = "0.8"
 # makes the dependency nameable. Version must track Tauri's (see Cargo.lock).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# The GPU terminal (crate::gpu_term): wgpu, swash and the embedded font (~520 KB
+# of TTF). Release size cost NOT yet measured (COMPLETED.md, Phase 20). Nothing runs
+# until a terminal pane attaches; then device creation is tens of ms on a
+# background thread. gdkx11 is already linked by Tauri; it names the X window.
+# Linux only for now: the child-window approach is X11-specific.
+opspilot-render = { path = "../render" }
+gdkx11 = "0.18"
+# Test harness only (crate::latency_probe, feature `latency-probe`): reads the
+# window's pixels on a second X connection. Not in a normal build.
+x11rb = { version = "0.14", optional = true }
+
+[features]
+# Keystroke → pixel latency harness on the real display. See latency_probe.rs.
+latency-probe = ["dep:x11rb"]
 
 # poll() on the PTY and killpg() on close (session.rs). Already linked through
 # portable-pty and tokio: no new code in the binary.
@@ -59,5 +73,3 @@ serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util", "macros"] }
 opspilot-test-sshd = { path = "../test-sshd" }
 
-# Still NOT wired in — §3 wants engine crates behind feature flags, lazy-loaded:
-# opspilot-render     = { path = "../render",     optional = true }

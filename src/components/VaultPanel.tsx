@@ -71,7 +71,7 @@ export function VaultPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
+    <div data-overlay className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
       <div className="flex max-h-[80vh] w-[560px] flex-col border-hairline border-bezel-500 bg-chassis-800">
         <header className="flex items-center justify-between border-b-hairline border-bezel-500 px-4 py-2">
           <p className="font-condensed uppercase text-eyebrow text-text-lo">vault</p>

@@ -47,6 +47,7 @@ export function Tooltip({
       {open && (
         <span
           role="tooltip"
+          data-overlay
           className={`pointer-events-none absolute z-50 whitespace-nowrap border-hairline
                       border-bezel-500 bg-chassis-700 px-2 py-[2px] text-micro
                       text-text-hi shadow-none ${position}`}

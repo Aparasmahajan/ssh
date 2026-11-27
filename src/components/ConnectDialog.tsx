@@ -178,7 +178,7 @@ export function ConnectDialog({
   }
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
+    <div data-overlay className="absolute inset-0 z-50 flex items-center justify-center bg-chassis-900/80">
       <form
         onSubmit={submit}
         className="w-[440px] border-hairline border-bezel-500 bg-chassis-800 p-4"
