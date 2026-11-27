@@ -1815,6 +1815,386 @@ latency the download reached 195 MB/s and the striped upload 129 MB/s.
 
 ---
 
+## Phase 20 — GPU renderer (2026-11-26)
+
+`crates/render`, previously a placeholder, is now the renderer the
+`spike/wgpu-compose` measurements chose (docs/spikes/wgpu-compose.md on that
+branch), and on Linux/X11 the app draws terminals with it (part 2 below).
+
+### What is in it
+
+- **Font** (`font.rs`). JetBrains Mono NL, four faces, subset with fontTools to
+  the terminal's ranges and embedded (about 130 KB each, 4 faces; OFL text
+  alongside). No system lookup on cold start, and the cell size is identical on
+  every machine. Cells are **whole pixels** (7.5 px advance → 8), so every
+  column starts on a pixel and one bitmap serves every column. Hinted with
+  swash.
+- **Box drawing and blocks drawn to the cell** (`boxdraw.rs`). The font's box
+  glyphs span the em box; at line height 1.36 vertical strokes stop short of the
+  row and `tree` output comes out dashed. All light/heavy lines and junctions,
+  half lines, `═ ║` and every block element are drawn; dashes and the other
+  double-line junctions still come from the font.
+- **Atlas** (`atlas.rs`). 2048² R8, shelf-packed. ASCII pre-rasterized at start
+  (§5.7) with a direct-indexed fast path. No CPU mirror of the texture (4 MiB
+  saved), only an upload queue. A full atlas clears and bumps an epoch, and
+  frames built against the old epoch rebuild.
+- **Frame** (`frame.rs`). Rows → instanced quads, cached per row; only damaged
+  rows rebuild (§5.3). Layers: background runs (one quad per run, not per
+  cell), glyphs and underline/strike, cursor (block with the glyph inverted;
+  hollow when unfocused), selection. Reverse, dim, hidden, bold, italic, wide
+  characters.
+- **GPU** (`gpu.rs`, `shader.wgsl`). One pipeline, one draw call. Glyph quads
+  are pixel-aligned, so the shader fetches atlas texels directly with no
+  sampler. **One colour pipeline for every target** (non-sRGB format, gamma-space
+  blending like canvas and cairo). That fixes the brightness jump the spike
+  showed between its two paths. The alpha channel is blended so it stays 1;
+  plain alpha blending leaves `a² + 1 − a` under glyph edges, which the overlay
+  path would show as see-through text. Offscreen read-back for tests and the
+  overlay path.
+
+### Measured (`benches/frame.rs`, machine at load 25)
+
+| | time |
+|---|---|
+| full rebuild, dense 200×50 coloured screen | 0.46 ms |
+| one row changed (typing) | 9 µs |
+
+### Verified
+
+- 22 unit tests, plus 3 GPU tests on the real adapter (`tests/gpu.rs`: VT bytes
+  → screen → pixels): cell placement, colours, backgrounds, box drawing reaching
+  the cell edge, cursor inversion, selection blend, and **a damage-driven frame
+  is byte-identical to a full rebuild**. The GPU tests skip without an adapter.
+  `OPSPILOT_RENDER_DUMP=dir` writes the frames for a look by eye.
+
+### Found on the way: every webfont was missing a–z
+
+`scripts/vendor-fonts.mjs` picked fontsource's `latin-ext` slice as the "widest"
+subset. That slice has **no basic Latin at all**, so all seven bundled faces had
+no a–z and **the whole UI has been rendering in the system fallback face**
+(DejaVu here), with no error. The script now vendors `latin` and `latin-ext`,
+and `fonts.css` declares both with fontsource's unicode-ranges. JetBrains Mono
+now comes from `crates/render/fonts/`, so the canvas and GPU terminals draw the
+same face, and both have box drawing (Pending §5 item 1, now fixed). Checked by
+reading each file's cmap and by a `vite build`. **Not checked by eye in the
+running app.**
+
+### Part 2: wired into the app (`crates/app/src/gpu_term.rs`)
+
+- **One native child window per terminal pane**, created through GDK on the
+  main thread, click-through (empty input region), with a wgpu surface on it.
+  Present mode Immediate, else Mailbox, else Fifo.
+- **One render thread** (§13.2) owns the device, the atlas and every surface.
+  It draws a pane when its session's generation moves: coalesced to 60 Hz for
+  output (§5.4), and polled every 2 ms for the 50 ms after a keystroke
+  (`session_write` wakes it), so an echo or prediction is drawn as soon as it
+  exists. Idle cost measured: **0.4% of a core** for the thread.
+- **The webview keeps input, selection and layout.** Each frame it compares
+  the pane's rect, focus, selection, font and overlay state with what it last
+  sent, and calls `gpu_pane_set` only on a change. Cell metrics come from Rust
+  (whole pixels) and the canvas lays out the same grid.
+- **Overlays**: elements marked `data-overlay` (palette, connect dialog, host
+  editor, vault, tooltip) hide the child window of any pane they intersect.
+  The canvas, which keeps its rows current underneath, paints while hidden.
+  No compositing hook was needed, so the spike's C2 path is not used.
+- **Two damage consumers.** `Session`'s dirty flags became a per-consumer
+  bitmask (webview, GPU). With one shared flag, whichever consumer polled first
+  took the damage and the other drew stale rows. Test:
+  `snapshot_and_paint_do_not_steal_each_others_damage`.
+- **Falls back** to the canvas on Wayland, with no adapter, or off Linux, and
+  says why on stderr (`gpu terminal off, using the canvas: ...`).
+
+Checked in the real app on a nested Xephyr display (lavapipe, since Xephyr has
+no DRI3): colours, bold, underline, `ls --color`, `tree` joining across rows,
+drag selection drawn by the GPU, hollow cursor when unfocused, palette and
+dialog on top with the canvas showing under them, the child following window
+grow and shrink with the shell reflowing, and a 300,000-line `seq` ending on the
+right final state. Found and fixed on the way: the canvas selection layer could
+keep a stale highlight while hidden (now resynced whenever the canvas takes
+over). Workspace: **345 tests pass**, clippy `-D warnings`, typecheck, and lint
+are clean.
+
+### Keystroke → pixel, the real app on the real display
+
+Your X11 desktop (xfwm4 compositing, 1920×1080 at 60 Hz, Intel Iris Xe), a
+local zsh, debug build. Harness: `crates/app/src/latency_probe.rs`, built with
+`--features opspilot-app/latency-probe` and run with
+`OPSPILOT_LATENCY_PROBE=1` (add `OPSPILOT_GPU_TERM=0` for the canvas). It
+dispatches real GDK key events to the app's own window with
+`gtk_main_do_event`, so nothing goes to the desktop. A second X connection
+polls a pixel in the cursor's cell. The path measured is GTK → WebKit → the
+page's keydown → IPC → PTY → zsh echo → parse → draw → present → pixel.
+150 samples per run after 10 warm-up, keys 120–320 ms apart.
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| canvas (the old path) | 24.57 ms | 33.78 | 44.70 |
+| GPU, first cut (echo polled every 2 ms) | 7.16 ms | 9.39 | 18.82 |
+| **GPU, echo wakes the render thread** | **5.36 ms** | 8.27 | 14.87 |
+| *(a second run of the same)* | 5.42 ms | 8.50 | 20.61 |
+
+**4.6× faster than the canvas at p50.** It still misses §4's 5 ms p50, by
+0.4 ms, and its 12 ms p99. Where the time goes (p50, final build):
+
+| stage | p50 | p90 |
+|---|---|---|
+| key → `session_write` (GTK, WebKit, JS, IPC) | 1.53 ms | 2.01 |
+| write → draw (PTY, shell echo, parse, wake) | 0.23 ms | 0.37 |
+| draw → present (build, submit) | 0.91 ms | 1.10 |
+| present → pixel (driver, X server) | 2.72 ms | 5.28 |
+
+- **Found by the breakdown:** write → draw was a steady 2.1 ms. That was the
+  render thread polling for the echo every 2 ms, while the shell echoes in
+  about 0.2 ms. Session readers now wake the render thread directly
+  (`gpu_term::output`), but only for 50 ms after a keystroke, so floods stay
+  coalesced to frames. Saved 1.8 ms.
+- present → pixel and its tail are the driver and X server. Not investigated.
+
+### Keys handled natively (`crates/app/src/keys.rs`, `gpu_term::on_key_press`)
+
+The 1.5 ms of WebKit, page and IPC is gone for terminal keys. While a GPU pane
+is focused **and not covered by an overlay**, a GTK `key-press-event` hook on
+the toplevel runs before WebKit. It encodes the key in Rust, writes it to the
+session (every pane in the tab while broadcasting) and wakes the renderer. It
+swallows the matching key release, and tells the page (`term-native-key`) so
+typing still clears the selection.
+
+- `keys.rs` is a rule-for-rule port of `src/lib/keys.ts`, and its 8 tests are
+  the TS suite's cases. Both encoders stay: the page still handles the canvas
+  path and every key Rust passes on.
+- **Passed to the page untouched:** every Ctrl+Shift chord (palette, copy,
+  paste, close tab, and Ctrl+_ undo), Ctrl+PageUp/PageDown, Shift+PageUp/PageDown,
+  Shift/Ctrl+Insert, Ctrl+Alt+Left/Right, Alt+Shift splits, Ctrl+digits and
+  zoom, Super, dead keys, and anything without a known encoding.
+- **Overlay rule.** The native path stops while a palette or dialog covers the
+  pane, and the page decides where keys go. Focus reaches Rust asynchronously
+  from the page; without this rule, a key typed in that window could go to the
+  shell behind a dialog. One unexplained run in the nested display, never
+  reproduced in three exact replays, typed into the shell behind an open
+  palette. The rule makes that impossible from the native side.
+- Checked in the real app (nested display): typing, Ctrl+C interrupting
+  `sleep`, Up recalling history, `cat -v` showing `^[OA` / `^[[A` under DECCKM
+  on and off, `^[[1;5D`, `^[[Z`, `^[b`, the palette chord, typing in the palette,
+  selection cleared by a keystroke. (F5 arrived as Alt+F5 on *both* the native
+  and the old JS path there: xdotool reaches F5 through an Alt level in that
+  server's keymap.)
+- **Measured on the real display, machine idle, two runs:**
+
+  | | p50 | p90 | p99 |
+  |---|---|---|---|
+  | GPU, before native keys | 5.36 ms | 8.27 | 14.87 |
+  | **GPU, native keys** | **5.04 ms** | 7.85 | 19.42 |
+  | *(a second run of the same)* | 5.03 ms | 6.22 | 23.88 |
+
+  | stage | before | native keys (p50, p90) |
+  |---|---|---|
+  | key → write | 1.53 ms | **0.10**, 0.12 |
+  | write → draw | 0.23 ms | 0.26, 0.36 |
+  | draw → present | 0.91 ms | 0.83, 1.23 |
+  | present → pixel | 2.72 ms | **3.87**, 6.52 |
+
+  Key → write fell by 1.4 ms; p50 improved only 0.3 ms because present →
+  pixel came out 1.1 ms higher in the same runs. That stage follows the GPU's
+  power state (next section), so the 0.3 ms is within run-to-run drift. The
+  p99 tail is all present → pixel. (A run during a game read 11.69 ms and is
+  discarded.)
+- **Harness gotcha:** run it with a scratch `HOME` that has a `.zshrc`. With an
+  empty `HOME`, zsh opens its new-user wizard instead of a prompt, nothing
+  echoes, and the probe reports "keys never showed up".
+
+### Chasing present → pixel (what did not help, and why the numbers drift)
+
+With native keys the app's own stages total about 1.1 ms; the rest is after
+`present`. Tried, all on the real display, debug build unless noted:
+
+| change | p50 | verdict |
+|---|---|---|
+| Immediate (current) | 5.0 ms | keep |
+| Mailbox | 15.3 ms | 3× worse |
+| Fifo | 14.4 ms | 3× worse |
+| release build (fat LTO) | 5.00 ms | no change: dependencies already build at opt-level 3 in dev |
+| pre-wake: a trivial GPU submit when the key arrives | 5.06 / 5.08 vs 4.95 off | no gain, reverted: it moved 0.25 ms from submit onto the render thread just as the echo arrived |
+| a 250 µs gap between the probe's `GetImage` polls | 4.97 ms | the probe does not load the X server it measures |
+
+Split further: build 12 µs, acquire 0.1 ms, encode 0.13 ms, **submit
+0.42 ms**. Waiting for the GPU before presenting showed it takes about 1.7 ms
+to execute a frame of one clear and 2–3 quads at 1006×894: 1.8–2.0 ms cold,
+0.9 ms when submitted again immediately.
+
+**The GPU's clock is most of the gap, and area is most of the rest.** With
+the GPU free to idle at 100 MHz, each keystroke's frame is too short a burst
+for the driver to clock up for, and the results drift by more than any change
+above. Early runs suggested latency scales with surface area (2.64 ms p50 at a
+small window, 5.80 at a large one); an hour later, with the GPU idling at
+100 MHz instead of 1,100, interleaved runs gave the reverse (small 6.8 ms,
+default 5.3). Pinning the minimum clock at 800 MHz (`gt_min_freq_mhz`, root,
+a diagnostic only) made it repeatable, two interleaved rounds each:
+
+| GPU floor 800 MHz | p50 | p90 | present → pixel p50 |
+|---|---|---|---|
+| default, 1006×894 terminal | 3.16 / 3.19 ms | 3.60 / 4.13 | 1.86 / 1.87 ms |
+| small, 366×494 terminal | 2.12 / 2.11 ms | 2.52 / 2.52 | 0.82 / 0.85 ms |
+
+So about 2 ms of the 5 ms p50 is the GPU clock, and about 1 ms of what remains
+at the default size is drawing and copying the whole surface for a one-cell
+change. The reversal at 100 MHz fits the clock governor upclocking for large
+frames and never for small ones; that is a guess, not measured. **p99 is
+14–22 ms in every configuration**, clock and size alike, and is all present →
+pixel: a separate tail, not yet explained. Compare only interleaved A/B runs,
+log `/sys/class/drm/card0/gt/gt0/rps_cur_freq_mhz` with them, and check
+nothing else is busy (a browser tab at 180% CPU spoiled one round).
+
+Not possible:
+- Taking the child out of the compositor: a compositor
+  redirects the toplevel together with its children, and xfwm4 unredirects
+  only fullscreen windows.
+
+Probe switches (probe builds only): `OPSPILOT_PROBE_PRESENT=immediate|mailbox|fifo`,
+`OPSPILOT_PROBE_GPU_WAIT=1` (wait for the GPU before present; reports GPU time),
+`OPSPILOT_PROBE_POLL_US=n`, `OPSPILOT_PROBE_WINDOW=WxH`. The probe now quits
+through `app.exit`, the normal path: `process::exit` segfaulted in Mesa's exit
+handlers in 2 of about 12 runs, while `app.exit` was clean in 15 runs.
+
+### Damage-only presentation (`crates/render/src/present.rs`)
+
+wgpu's surface cannot present part of a window: it treats each acquired image
+as uninitialised (so it clears it) and does not expose
+`VK_KHR_incremental_present`, which the driver supports. So on Linux/Vulkan
+each pane owns its swapchain underneath wgpu:
+
+- The device is opened through wgpu-hal's `open_with_callback`, adding
+  `VK_KHR_incremental_present`, then handed back to wgpu.
+- `Frame` now tracks damage: rebuilt rows, the cursor's old and new rows, the
+  selection's old and new rows, everything after an invalidate. One band,
+  full width, widened a row each side for glyph overhang.
+- `Renderer::draw_damage` loads the previous canvas, fills the band with the
+  background and draws every instance scissored to it.
+- `Presenter` copies into each swapchain image the union of damage since that
+  image was last shown (a full copy if it is older than 16 frames or new),
+  and presents with the band as the region. One small raw command buffer;
+  the canvas goes back to the layout wgpu's tracker expects.
+- Falls back to wgpu's surface on any error; `OPSPILOT_GPU_DAMAGE=0` forces
+  that, for comparison.
+
+Verified: the GPU test `damage_only_frames_match_a_full_redraw` (typing,
+backspace, a new line, a selection appearing and moving, the cursor going
+unfocused: each damage-only frame equals a fresh full render, pixel for
+pixel); in the nested display, typing and editing mid-line, `seq 1 200000`,
+colours, `less` and back, a drag selection, focus loss, a split (remount and
+resize, two presenters on one device) and closing the tab.
+
+Two bugs found on the way:
+
+- **A window shown again kept stale pixels.** Showing a child queues the map
+  on GTK's X connection; the render thread presents on Mesa's. A present that
+  reaches the server first is dropped. wgpu's surface hid this by repainting
+  everything on the next change; a damage-only window never repairs it. Now
+  the map is followed by a round trip (`show_synced`) and an `Exposed`
+  message, and the next **two** frames present the whole window: with one,
+  2 of 6 palette open/close cycles still left the window's own pixels stale;
+  with two, 0 of 12. The old path measured 6 of 6 clean (it presented twice
+  by accident).
+- **Closing or splitting a pane segfaulted** (libgdk-3), on both paths and
+  since part 2. `gdk_window_destroy` unrefs the window, and the gtk-rs binding
+  passes a borrowed pointer, so dropping our handle freed it twice. Fixed in
+  `destroy_window`. Splits had not been exercised on the GPU path before.
+
+**Latency.** Four interleaved pairs on the real display, stock clock floor
+(100 MHz), machine quiet (load about 1):
+
+| | p50 of each run | median | p90 range |
+|---|---|---|---|
+| **damage-only** | 4.71, 4.68, 4.65, 4.67 ms | **4.67 ms** | 5.5–7.4 |
+| wgpu surface | 4.99, 4.93, 4.99, 4.95 ms | 4.97 ms | 5.5–8.2 |
+
+Damage-only won all four pairs, by about 0.3 ms, all of it in present →
+pixel (3.58 against 3.77 ms). Smaller than the ~1 ms the pinned-clock area
+test suggested: at the stock floor most of what is left is the idle GPU, not
+area. It puts p50 under §4's 5 ms in every run. **p99 is unchanged** (14–26 ms
+on both paths): that tail is not area either.
+
+An earlier set of pairs, with the machine busy (npm, a VM, another WebKit
+app; p90 18–26 ms everywhere), gave medians of 5.75 against 6.4 ms and one
+pair the other way: the same direction, unusable as a number.
+
+### The p99 tail is after the present, in the X server
+
+Three runs of 700–800 samples with a per-sample CSV
+(`OPSPILOT_PROBE_SAMPLES`, `OPSPILOT_PROBE_CSV`, which also records wall time
+and the probe's last `GetImage` round trip):
+
+- **The app's own part is small at p99.** Key → present: 1.09–1.14 ms p50,
+  **1.75–2.67 ms p99**, 5.6 ms max. Every slow sample is slow in present →
+  pixel.
+- **Our GPU work is not what waits.** With `OPSPILOT_PROBE_GPU_WAIT=1`, slow
+  samples finished our render *sooner* than fast ones (1.2 against 2.0 ms);
+  the time went after the present, in the X server answering the probe's
+  pixel read 7–16 ms late.
+- Slow samples were not tied to the key, the idle gap before it, or a 60 Hz
+  phase; they came about every 5 s, sometimes in bursts.
+- Other apps' GPU use (fdinfo, 50 ms timeline) was only 1.5× higher around
+  slow keystrokes than fast ones, 2.5% against 1.6% of the GPU: not it.
+- **With OpsPilot closed, the X server stalls the same way.**
+  `scripts/x-stall-monitor.c`, 90 s of 1 ms round trips: a plain round trip
+  never took over 10 ms (max 8.3), but one that syncs with the GPU (a 1×1
+  `GetImage`, the probe's kind of read) took over 10 ms **21 times**, max
+  16.1 ms, in bursts. Same size and rate as the probe's tail.
+
+So on this desktop (Xorg with glamor, xfwm4 compositing, Iris Xe at its idle
+clock) anything that waits for the GPU through the X server regularly waits
+10–16 ms.
+
+**But that is not the whole tail.** Compositor on/off, interleaved, 45 s of
+the monitor and 300 probe samples each, with other work going on:
+
+| | X stalls >10 ms | probe p50 | p90 | p99 |
+|---|---|---|---|---|
+| compositor on, round 1 | 71 | 4.38 ms | 7.0 | 14.2 |
+| compositor off, round 1 | 52 | 5.49 ms | 16.2 | 23.4 |
+| compositor on, round 2 | **1** | 4.60 ms | 7.8 | **19.4** |
+| compositor off, round 2 | 377 | (probe window was behind other windows) | | |
+
+- **Compositor off is worse.** The minimum rose from about 1.8 to 4.3 ms and
+  p90 to 16 ms: without a compositor the X server ties windowed presents to
+  vblank. Not a fix, and not something to tell users.
+- **In round 2 the monitor saw one stall in 45 s and the probe's p99 was
+  still 19.4 ms.** So general X server stalls make the tail worse when they
+  happen, but part of it is specific to presenting our window (Present on a
+  redirected window, both present paths). Not yet explained.
+
+The app's own share stays under 3 ms at p99 in every run.
+
+Dead end, recorded so it is not repeated: splitting present → pixel with
+the Present extension's `CompleteNotify`. For an immediate copy to a window,
+Xorg stamps the event with the last vblank's time, not the time it executed
+the copy, so only presents that a vblank happened to follow could be
+matched (11–20% of them, biased slow), and the split was meaningless. The
+code was removed.
+
+### Not done
+
+- **§4 latency budget:** p50 is met: 4.67 ms against < 5 ms at the GPU's
+  stock clock floor, with damage-only presentation. **p99 end to end is
+  not:** 14–26 ms against < 12 ms. The app's share of p99 is 1.8–2.7 ms; the
+  rest is after the present, in the X server: partly its own GPU-synchronised
+  stalls (present with the app closed), partly the present path for our
+  window, not yet explained (see "The p99 tail is after the present").
+  Compositor off is worse. Untested: a Wayland session.
+- **Release binary size cost unmeasured** (wgpu + swash + fonts).
+- Wayland, Windows and macOS use the canvas. HiDPI is coded (device-pixel
+  surfaces and font size) but untested.
+- Refresh rate is fixed at 60 Hz (§14.6 wants the panel's rate).
+- The webview still polls snapshots and serializes changed rows while the GPU
+  path draws. It needs them for selection text and the overlay fallback; a
+  text-only snapshot would cut that cost.
+- **No fallback fonts.** Anything outside the subset (CJK, emoji) draws as
+  U+FFFD. Needs a lazy system lookup, plus an RGBA atlas for colour emoji.
+- Rounded corners are drawn square; Powerline separators come from the font.
+- Cell metrics must come from Rust once the GPU path is live. The canvas
+  measures fractional advances (7.5 px) and would disagree on column count.
+
+---
+
 ## Pending
 
 One authoritative list, replacing the old "Open items" section.
@@ -1873,12 +2253,9 @@ Ordered by what it costs to not have.
 
 ### 5. Environment — blocked on downloads never authorised
 
-1. **Mono fonts have no box-drawing glyphs.** `@fontsource` ships only
-   Google-Fonts-derived subsets; none covers U+2500–259F.
-   `scripts/vendor-fonts.mjs` warns per face. **Consequence: `systemd` and `tree`
-   output renders as tofu.** The fix is the `pyftsubset` command already in
-   `src/styles/fonts.css`, needing `pip install fonttools brotli` plus the full
-   IBM Plex and JetBrains Mono TTFs.
+1. ~~**Mono fonts have no box-drawing glyphs.**~~ Fixed in Phase 20: JetBrains
+   Mono comes from the upstream TTF, subset with fontTools. The same phase
+   found the bigger problem, that every face lacked a–z.
 2. **Playwright Chromium is not installed**, so `tests/visual/visual-check.spec.ts`
    has **never executed** — including the `document.fonts.check()` assertion that
    would catch item 1. ~120 MB.

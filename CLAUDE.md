@@ -840,3 +840,92 @@ Measured through a 40 ms RTT proxy against OpenSSH (`core-sftp/tests/sshd.rs`):
 When a pipeline stops scaling, test a deep **fixed** window first: if that does
 not move the number either, the limit is not the window you are tuning.
 
+### 18.24 Measure the whole keystroke, then split it into stages
+
+The spike measured the renderer alone at 3.86 ms. The app measured 7.16 ms for
+a real key event through to pixels, and only a per-stage breakdown showed why.
+2.1 ms of it was a render thread *polling* for the echo every 2 ms, while the
+shell had answered in 0.2 ms. Waking the renderer from the reader fixed it.
+A steady stage time equal to a timer interval is a timer, not work. The
+harness (`crates/app/src/latency_probe.rs`) injects GDK key events into the
+app's own window and reads pixels on a second X connection. Re-run it after
+any change to the input or render path.
+
+Two more numbers worth knowing before optimizing: WebKit plus the page plus
+IPC cost **1.5 ms** of every keystroke (0.10 ms once keys were handled natively,
+`crates/app/src/keys.rs`), and the canvas terminal it replaced measured
+**24.6 ms** p50. With native keys the app's own stages total about 1.2 ms; the
+rest of the 5.0 ms p50, and the whole p99 tail, is present → pixel.
+
+Give the harness a scratch `HOME` with a `.zshrc`: with an empty `HOME` zsh
+opens its new-user wizard, nothing echoes, and every key "never shows up".
+
+Check the load average before trusting a latency run. Then distrust it
+anyway: after `present`, latency follows the GPU's clock, and an idle Intel GPU
+sits at its floor because a keystroke's frame is too short a burst to clock up
+for. That alone was about 2 ms of a 5 ms p50, and it made a window-size result
+reverse between runs an hour apart. Interleave A/B runs and log the GPU clock
+with them; to isolate a change, pin the minimum clock (a diagnostic, root).
+One run here coincided with a game on the same GPU, and every stage the change
+did not touch got 2–3× slower.
+
+Before chasing a p99, check whether the desktop already has it:
+`scripts/x-stall-monitor.c` with the app closed. On the dev machine the X
+server's GPU-synchronised round trips stall 10–16 ms about every few seconds
+on their own, which explains much of the terminal's p99 tail, though not all
+of it (one run had a 19 ms p99 while the monitor saw a single stall). The
+app's own key → present p99 was under 3 ms. Report the two separately, and do
+not suggest turning the compositor off: windowed presents then wait for
+vblank, and every percentile got worse.
+
+If you change key handling, change `src/lib/keys.ts` and `crates/app/src/keys.rs`
+together: there are two encoders with mirrored test suites.
+
+### 18.25 A keystroke should not repaint the window (amends §5.7)
+
+§5.3 limits *uploads* to damaged rows, but wgpu's surface still **clears,
+draws and presents the whole window every frame**: it treats each acquired
+image as uninitialised and cannot say which part changed. Pinning the GPU
+clock showed what that costs: one changed cell took 3.2 ms p50 at 1006×894
+and 2.1 ms at 366×494, with the difference all in present → pixel (copy and
+composite).
+
+So on Linux/Vulkan the terminal owns its swapchain underneath wgpu
+(`crates/render/src/present.rs`). wgpu draws only the damaged band into a
+persistent canvas texture; raw Vulkan copies to each swapchain image what it
+has missed since it was last shown, and presents with
+`VK_KHR_incremental_present` naming the band. The device is opened through
+wgpu-hal's `open_with_callback` to enable that extension. Everything else
+stays wgpu. `OPSPILOT_GPU_DAMAGE=0` turns it off for comparison, and any
+failure falls back to wgpu's surface. Measured at the stock clock, quiet machine:
+4.67 ms p50 against 4.97, every interleaved pair; p99 unchanged.
+
+Rules that came with it:
+
+- The canvas is a wgpu texture. Raw commands may change its layout only if
+  they put it back to the layout wgpu's tracker believes it is in
+  (`COLOR_ATTACHMENT_OPTIMAL` after a render pass) before wgpu records again.
+- **A damage-only window cannot repair itself.** Anything that loses the
+  window's contents (it was hidden by an overlay, or just created) must be
+  followed by a whole-window present. A present that races the map is
+  dropped, so map with a round trip (`show_synced`) and then present whole
+  for two frames: in testing the first was still lost about one time in
+  three. The full-repaint path had the same race and hid it by accident: it
+  repainted everything on the next change.
+- A damage-only frame must equal a full redraw, pixel for pixel. That is a
+  GPU test (`damage_only_frames_match_a_full_redraw`), run it.
+
+### 18.26 Bindings that look safe at the native boundary
+
+- **`gdk::Window::destroy` frees the window you still hold.** GDK 3's
+  `gdk_window_destroy` ends with `g_object_unref`, consuming the reference
+  `gdk_window_new` gave you; gtk-rs 0.18 passes a borrowed pointer, so
+  dropping the handle afterwards unrefs freed memory. Every pane close and
+  every split segfaulted in libgdk-3. Destroy through `destroy_window`, which
+  forgets the handle. Same lesson as §18.1 and §18.22: a safe-looking API is
+  not a statement about ownership.
+- **`pgrep -f` / `pkill -f` match your own shell.** The pattern is on the
+  shell's command line too; the shell kills itself (exit 144). Match by exact
+  name (`pgrep -x`) or by pid, and never by a pattern that could also match
+  the desktop's own processes.
+
